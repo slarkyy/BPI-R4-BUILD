@@ -1,19 +1,23 @@
 #!/bin/bash
 
 # BPI-R4 OpenWrt/MediaTek Build Automation Script (OpenWrt 24.10.2 Release)
-# Cleaned-up version for stable v24.10.x series, v6.7
-# Maintainer: Luke, with Outlier AI assistance
+# Clean, portable: all overlays in BPI-R4-BUILD/
+# Maintainer: Luke
 
 set -euo pipefail
 
-# --- Configuration ---
+# --- Relative Build Asset Locations ---
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-OPENWRT_DIR="$SCRIPT_DIR/OpenWRT_BPI_R4"
+REPO_ROOT="$SCRIPT_DIR"       # Assume script is run from BPI-R4-BUILD
 
+OPENWRT_DIR="$REPO_ROOT/OpenWRT_BPI_R4"
 PROFILE="filogic-mac80211-mt7988_rfb-mt7996"
-LEXY_CONFIG_SRC="/home/luke/mm_config"
-DEVICE_FILES_SRC="/home/luke/files"
-BUILDER_FILES_SRC="$SCRIPT_DIR/bpi-r4-openwrt-builder"
+
+LEXY_CONFIG_SRC="$REPO_ROOT/mm_config"
+DEVICE_FILES_SRC="$REPO_ROOT/files"
+BUILDER_FILES_SRC="$REPO_ROOT"
+EEPROM_BLOB=$(find "$REPO_ROOT" -maxdepth 1 -type f -iname '*.bin' | head -n1)
+DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
 
 MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
 OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
@@ -21,15 +25,10 @@ OPENWRT_TAG="v24.10.2"
 FEED_NAME="mtk_openwrt_feed"
 FEED_PATH="mtk-openwrt-feeds"
 
-CUSTOM_BE14_EEPROM="/home/luke/Eagle_MT7976C_MT7977iA_2i3i3i_6G_TSSI_OFF_TC_ON_Test_mode_20240116_V04 (1).bin"
-DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
-
 RED='\033[0;31m'
 NC='\033[0m'
-
 MIN_DISK_GB=12
-
-CLEAN_MARKER_FILE="$SCRIPT_DIR/.openwrt_cloned_this_session"
+CLEAN_MARKER_FILE="$REPO_ROOT/.openwrt_cloned_this_session"
 
 # --- Argument Parsing ---
 SKIP_CONFIRM=0
@@ -52,7 +51,7 @@ trap on_error ERR
 
 # --- Logging Setup ---
 DATE_TAG=$(date +"%Y-%m-%d_%H-%M-%S")
-LOG_FILE="$SCRIPT_DIR/build_log_${DATE_TAG}.txt"
+LOG_FILE="$REPO_ROOT/build_log_${DATE_TAG}.txt"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # --- Helper Functions ---
@@ -64,10 +63,10 @@ step_echo() {
 
 check_space() {
     local avail
-    avail=$(df --output=avail "$SCRIPT_DIR" | tail -1)
+    avail=$(df --output=avail "$REPO_ROOT" | tail -1)
     local avail_gb=$((avail / 1024 / 1024))
     if [[ "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
-        echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk on $SCRIPT_DIR. (Available: ${avail_gb}GB)${NC}"
+        echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk on $REPO_ROOT. (Available: ${avail_gb}GB)${NC}"
         exit 1
     fi
 }
@@ -82,6 +81,9 @@ check_requirements() {
     fi
     if [[ ! -f "$LEXY_CONFIG_SRC" ]]; then
         echo -e "${RED}ERROR: Expected .config file at $LEXY_CONFIG_SRC${NC}"; err=1
+    fi
+    if [[ -z "$EEPROM_BLOB" ]]; then
+        echo -e "${RED}ERROR: No EEPROM *.bin found at $REPO_ROOT${NC}"; err=1
     fi
     if [[ "$err" != 0 ]]; then
         echo -e "${RED}One or more required files/folders missing!${NC}"
@@ -114,15 +116,16 @@ ensure_patch_directories() {
 }
 
 inject_custom_be14_eeprom() {
-    local eeprom_src="$CUSTOM_BE14_EEPROM"
+    local eeprom_src="$EEPROM_BLOB"
     local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/$DEST_EEPROM_NAME"
     local fw_dir
     fw_dir="$(dirname "$eeprom_dst")"
+
     if [[ ! -f "$eeprom_src" ]]; then
-        echo -e "${RED}ERROR: BE14 EEPROM file not found at $eeprom_src${NC}"
-        echo "Please download or move the EEPROM bin file to that location before building."
+        echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"
         exit 1
     fi
+
     mkdir -p "$fw_dir"
     cp -af "$eeprom_src" "$eeprom_dst"
     echo "Copied EEPROM as $eeprom_dst"
@@ -279,7 +282,7 @@ apply_config_and_build() {
     if [ ! -d "$OPENWRT_DIR" ]; then echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}"; return 1; fi
     cd "$OPENWRT_DIR"
 
-    step_echo "Applying custom files from bpi-r4-openwrt-builder (my_files and configs)..."
+    step_echo "Applying custom files from BPI-R4-BUILD (my_files and configs)..."
     if [ ! -d "$BUILDER_FILES_SRC/my_files" ] || [ ! -d "$BUILDER_FILES_SRC/configs" ]; then
         echo -e "${RED}Error: Builder subfolders missing at '$BUILDER_FILES_SRC/my_files' or configs.${NC}"; return 1; fi
     safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
@@ -299,8 +302,18 @@ apply_config_and_build() {
     step_echo "Checking available disk space before building..."
     check_space
 
-    step_echo "Starting final build (make V=s -j$(nproc)). Build log is saved!"
-    make V=s -j$(nproc)
+    # --- Begin Build ---
+    step_echo "Starting final build (make V=sc -j$(nproc)). Build log is saved to:"
+    echo "    $LOG_FILE"
+    echo
+
+    if ! make V=sc -j"$(nproc)"; then
+        echo -e "${RED}##################################################"
+        echo "### ERROR: Build failed!                       ###"
+        echo "### Check the full build log at: $LOG_FILE     ###"
+        echo "##################################################${NC}"
+        exit 99
+    fi
 
     cd "$SCRIPT_DIR"
     echo -e "\n\n${NC}##################################################"
@@ -323,14 +336,14 @@ openwrt_shell() {
 
 show_menu() {
     echo ""
-    step_echo "BPI-R4 Build Menu (v6.7, now fixes config & df bug for 24.10.2+)"
-    echo "a) Run All Steps (Highly Recommended: will start FRESH, deletes previous sources)"
+    step_echo "BPI-R4 Build Menu (fully portable)"
+    echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
     echo "------------------------ THE PROCESS -----------------------"
     echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
-    echo "2) Prepare Tree (Clean/Remove Feeds, Install, Inject Firmware/EEPROM, requires clean step!)"
+    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, etc.)"
     echo "3) Apply Final Config & Run Build (make)"
     echo "------------------------ UTILITIES -------------------------"
-    echo "s) Enter OpenWrt Directory Shell (for debugging/inspection)"
+    echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
     echo "q) Quit"
     echo ""
 }
