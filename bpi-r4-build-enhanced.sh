@@ -1,22 +1,23 @@
 #!/bin/bash
 
 # BPI-R4 OpenWrt/MediaTek Build Automation Script (OpenWrt 24.10.2 Release)
-# Clean, portable: all overlays in BPI-R4-BUILD/
+# All overlays in BPI-R4-BUILD/contents/
 # Maintainer: Luke
 
 set -euo pipefail
 
 # --- Relative Build Asset Locations ---
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-REPO_ROOT="$SCRIPT_DIR"       # Assume script is run from BPI-R4-BUILD
+REPO_ROOT="$SCRIPT_DIR"
+CONTENTS_DIR="$REPO_ROOT/contents"
 
 OPENWRT_DIR="$REPO_ROOT/OpenWRT_BPI_R4"
 PROFILE="filogic-mac80211-mt7988_rfb-mt7996"
 
-LEXY_CONFIG_SRC="$REPO_ROOT/mm_config"
-DEVICE_FILES_SRC="$REPO_ROOT/files"
-BUILDER_FILES_SRC="$REPO_ROOT"
-EEPROM_BLOB=$(find "$REPO_ROOT" -maxdepth 1 -type f -iname '*.bin' | head -n1)
+LEXY_CONFIG_SRC="$CONTENTS_DIR/mm_config"
+DEVICE_FILES_SRC="$CONTENTS_DIR/files"
+BUILDER_FILES_SRC="$CONTENTS_DIR"
+EEPROM_BLOB=$(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin' | head -n1)
 DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
 
 MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
@@ -73,8 +74,11 @@ check_space() {
 
 check_requirements() {
     local err=0
-    if [[ ! -d "$BUILDER_FILES_SRC" ]]; then
-        echo -e "${RED}ERROR: Expected builder files at $BUILDER_FILES_SRC${NC}"; err=1
+    if [[ ! -d "$BUILDER_FILES_SRC/my_files" ]]; then
+        echo -e "${RED}ERROR: Expected builder my_files at $BUILDER_FILES_SRC/my_files${NC}"; err=1
+    fi
+    if [[ ! -d "$BUILDER_FILES_SRC/configs" ]]; then
+        echo -e "${RED}ERROR: Expected builder configs at $BUILDER_FILES_SRC/configs${NC}"; err=1
     fi
     if [[ ! -d "$DEVICE_FILES_SRC" ]]; then
         echo -e "${RED}ERROR: Expected 'files' directory at $DEVICE_FILES_SRC${NC}"; err=1
@@ -83,7 +87,7 @@ check_requirements() {
         echo -e "${RED}ERROR: Expected .config file at $LEXY_CONFIG_SRC${NC}"; err=1
     fi
     if [[ -z "$EEPROM_BLOB" ]]; then
-        echo -e "${RED}ERROR: No EEPROM *.bin found at $REPO_ROOT${NC}"; err=1
+        echo -e "${RED}ERROR: No EEPROM *.bin found at $CONTENTS_DIR${NC}"; err=1
     fi
     if [[ "$err" != 0 ]]; then
         echo -e "${RED}One or more required files/folders missing!${NC}"
@@ -282,13 +286,13 @@ apply_config_and_build() {
     if [ ! -d "$OPENWRT_DIR" ]; then echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}"; return 1; fi
     cd "$OPENWRT_DIR"
 
-    step_echo "Applying custom files from BPI-R4-BUILD (my_files and configs)..."
+    step_echo "Applying builder overlays from contents/my_files and contents/configs..."
     if [ ! -d "$BUILDER_FILES_SRC/my_files" ] || [ ! -d "$BUILDER_FILES_SRC/configs" ]; then
         echo -e "${RED}Error: Builder subfolders missing at '$BUILDER_FILES_SRC/my_files' or configs.${NC}"; return 1; fi
     safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
     safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
 
-    step_echo "Applying your custom 'files' overlay..."
+    step_echo "Applying your custom 'files' overlay from contents/files/..."
     safe_rsync "$DEVICE_FILES_SRC/" "./files/"
 
     step_echo "Applying .config file from $LEXY_CONFIG_SRC"
@@ -336,7 +340,7 @@ openwrt_shell() {
 
 show_menu() {
     echo ""
-    step_echo "BPI-R4 Build Menu (fully portable)"
+    step_echo "BPI-R4 Build Menu (overlays in contents/)"
     echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
     echo "------------------------ THE PROCESS -----------------------"
     echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
