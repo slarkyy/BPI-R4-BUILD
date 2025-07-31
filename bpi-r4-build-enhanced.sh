@@ -6,9 +6,7 @@ set -euo pipefail
 #  Maintainer: Luke Slark
 #  SPDX-License-Identifier: MIT
 #
-#  Updated by Outlier Model Playground AI, 2024-06:
-#    - Robust shell options, pushd/popd, cursor reset on EXIT, elapsed timings,
-#      consistent quoting, OpenWrt openwrt-24.10 enforced, make menuconfig in menu.
+#  Updated for openwrt-24.10 branch and robustness by Outlier AI
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -29,48 +27,7 @@ EEPROM_BLOB=$(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin' | head -n1
 DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
 MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
 OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
-OPENWRT_TAG_DEFAULT="openwrt-24.10"   # Enforce OpenWRT openwrt-24.10 branch
-FEED_NAME="mtk_openwrt_feed"
-FEED_PATH="mtk-openwrt-feeds"
-MIN_DISK_GB=12
-CLEAN_MARKER_FILE="$REPO_ROOT/.openwrt_cloned_this_session"
-
-SKIP_CONFIRM=0
-MENU_MODE=1
-RUN_ALL=0
-PROFILE="$PROFILECertainly! Here is your improved script with robust error handling, branch set to openwrt-24.10, pushd/popd, total elapsed time reporting, make menuconfig, and all previous suggestions included:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# ===========================================================================
-#  BPI-R4 / Mediatek OpenWrt Builder Script (bpi-r4-build-enhanced.sh)
-#  Maintainer: Luke Slark
-#  SPDX-License-Identifier: MIT
-#
-#  Updated for openwrt-24.10 branch and shell robustness by Outlier AI
-# ===========================================================================
-
-RED='\033[0;31m'
-NC='\033[0m'
-GREEN='\033[0;32m'
-
-### --- DIR & ENV VARS --- ###
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
-LOGS_DIR="$REPO_ROOT/logs"
-CONTENTS_DIR="$REPO_ROOT/contents"
-OPENWRT_DIR="$REPO_ROOT/OpenWRT_BPI_R4"
-PROFILE_DEFAULT="filogic-mac80211-mt7988_rfb-mt7996"
-LEXY_CONFIG_SRC="$CONTENTS_DIR/mm_config"
-DEVICE_FILES_SRC="$CONTENTS_DIR/files"
-BUILDER_FILES_SRC="$CONTENTS_DIR"
-EEPROM_BLOB=$(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin' | head -n1)
-DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
-MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
-OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
-OPENWRT_TAG_DEFAULT="openwrt-24.10"  # <-- Branch enforced here
+OPENWRT_TAG_DEFAULT="openwrt-24.10"   # Use this branch
 FEED_NAME="mtk_openwrt_feed"
 FEED_PATH="mtk-openwrt-feeds"
 MIN_DISK_GB=12
@@ -81,16 +38,17 @@ MENU_MODE=1
 RUN_ALL=0
 PROFILE="$PROFILE_DEFAULT"
 OPENWRT_TAG="$OPENWRT_TAG_DEFAULT"
+
 warn_at_script_end=""
 
 START_SCRIPT_TIME=$(date +%s)
 BUILD_START_TIME=0
 
-# Always reset cursor on exit/int/err
+# Always clean up cursor no matter how we exit
 cleanup() { tput cnorm || true; }
 trap cleanup EXIT
 
-# --- Protect from system wipes ---
+# --- Protect us from system wipes ---
 function protect_dir_safety() {
     local tgt="$1"
     if [[ "$tgt" == "/" || "$tgt" =~ ^/root/?$ || "$tgt" =~ ^/home/?$ || "$tgt" == "" ]]; then
@@ -125,6 +83,7 @@ on_error() {
 }
 trap on_error ERR INT
 
+### --- STEP ECHO / PROGRESS --- ###
 step_echo() {
     echo "================================================================="
     echo "=> $1"
@@ -132,6 +91,7 @@ step_echo() {
 }
 log_progress() { echo "Progress: Step $1 of $2"; }
 
+### --- PREREQ, INTERNET, DEPS --- ###
 check_required_tools() {
     echo "Checking for required tools..."
     local missing=()
@@ -198,4 +158,323 @@ check_space() {
     local avail
     avail=$(df --output=avail "$REPO_ROOT" | tail -1)
     local avail_gb=$((avail/1024/1024))
-    if [[ "$avail_g
+    if [[ "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
+        echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk on $REPO_ROOT. (Available: ${avail_gb}GB)${NC}"
+        exit 5
+    fi
+}
+
+### --- UTILITY / OVERLAY / SAFETY --- ###
+safe_rsync() {
+    local SRC="$1"
+    local DST="$2"
+    rsync -a --delete --info=progress2 "$SRC" "$DST" || {
+        echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"; exit 6; }
+}
+register_feed() {
+    local FEED_NAME="$1"
+    sed -i "/$FEED_NAME/d" feeds.conf.default
+    echo "Feed '$FEED_NAME' lines cleaned (addition deferred to MTK autobuilder)."
+}
+ensure_patch_directories() {
+    local dir="$OPENWRT_DIR/package/boot/uboot-envtools/files"
+    [[ ! -d "$dir" ]] && { mkdir -p "$dir"; echo "Created missing patch directory: $dir"; }
+}
+inject_custom_be14_eeprom() {
+    local eeprom_src="$EEPROM_BLOB"
+    local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/$DEST_EEPROM_NAME"
+    [[ ! -f "$eeprom_src" ]] && { echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"; exit 7; }
+    mkdir -p "$(dirname "$eeprom_dst")"
+    cp -af "$eeprom_src" "$eeprom_dst"
+    echo "Copied EEPROM as $eeprom_dst"
+}
+patch_config_for_main_be14_router() {
+    local config_file="$OPENWRT_DIR/.config"
+    [[ ! -f "$config_file" ]] && { echo -e "${RED}ERROR: Could not patch .config (file not found at $config_file)!${NC}"; exit 8; }
+    local WANTED_CONFIGS=$(cat <<'EOF'
+CONFIG_PACKAGE_kmod-mt7996=y
+CONFIG_PACKAGE_wireless-regdb=y
+CONFIG_PACKAGE_iw=y
+CONFIG_PACKAGE_wpad-openssl=y
+CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+CONFIG_PACKAGE_kmod-wwan=y
+CONFIG_PACKAGE_uqmi=y
+CONFIG_PACKAGE_luci-proto-qmi=y
+CONFIG_PACKAGE_modemmanager=y
+CONFIG_PACKAGE_luci-proto-modemmanager=y
+CONFIG_PACKAGE_minicom=y
+CONFIG_PACKAGE_usb-modeswitch=y
+CONFIG_PACKAGE_kmod-usb-serial-option=y
+CONFIG_PACKAGE_kmod-usb-serial=y
+CONFIG_PACKAGE_kmod-usb-acm=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_dnsmasq=y
+CONFIG_PACKAGE_firewall4=y
+CONFIG_PACKAGE_odhcpd-ipv6only=y
+CONFIG_PACKAGE_luci-app-mwan3=y
+CONFIG_PACKAGE_luci-app-statistics=y
+CONFIG_PACKAGE_usbutils=y
+CONFIG_PACKAGE_pciutils=y
+CONFIG_PACKAGE_htop=y
+CONFIG_PACKAGE_iftop=y
+CONFIG_PACKAGE_tcpdump=y
+CONFIG_PACKAGE_kmod-fs-ext4=y
+CONFIG_PACKAGE_kmod-fs-vfat=y
+CONFIG_PACKAGE_e2fsprogs=y
+CONFIG_PACKAGE_block-mount=y
+EOF
+)
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        grep -q -F "$line" "$config_file" || { echo "$line" >> "$config_file"; echo "  + Added: $line"; }
+    done <<< "$WANTED_CONFIGS"
+}
+check_for_patch_rejects() {
+    local build_dir="$1"
+    local rejs
+    rejs=$(find "$build_dir" -name '*.rej' 2>/dev/null)
+    if [[ -n "$rejs" ]]; then
+        echo -e "${RED}#########################################################${NC}"
+        echo -e "${RED} PATCH REJECT(S) DETECTED!${NC}"
+        echo "$rejs"
+        for file in $rejs; do
+            echo -e "${RED}---- $file ----${NC}"
+            cat "$file"
+            echo -e "${RED}---------------------------${NC}"
+        done
+        echo -e "${RED}=== Build aborted due to patch rejects. Please resolve them above. ===${NC}"
+        exit 77
+    fi
+}
+compare_configs_warn() {
+    if [[ -f .config && -f .config.old ]]; then
+        if ! diff -u .config.old .config > /dev/null; then
+            echo -e "${RED}WARNING: .config changed after defconfig!${NC}"
+            diff -u .config.old .config || true
+            sleep 2
+        fi
+    fi
+}
+
+### --- BUILD STEPS --- ###
+clean_and_clone() {
+    local total_steps=4 current_step=1
+    log_progress "$current_step" "$total_steps"
+    step_echo "Step 1: Clean Up & Clone Repos into a Fresh Directory"
+    protect_dir_safety "$OPENWRT_DIR"
+    rm -rf "$OPENWRT_DIR"
+    rm -f "$CLEAN_MARKER_FILE"
+    if [[ "$SKIP_CONFIRM" == "0" ]]; then
+        read -p "This will delete the '$OPENWRT_DIR' directory. Continue? (y/n) " -n 1 -r; echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Operation cancelled."; return 1; fi
+    else
+        echo "(--force: Skipping confirmation prompt for cleanup.)"
+    fi
+    step_echo "Cloning OpenWrt source code ($OPENWRT_TAG, shallow clone)..."
+    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_TAG" --depth 1 "$OPENWRT_REPO" "$OPENWRT_DIR"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "Cloning MediaTek feeds INSIDE the OpenWrt directory (shallow clone)..."
+    GIT_TERMINAL_PROMPT=0 git clone --progress --depth 1 "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    echo "Cloning complete."
+    touch "$CLEAN_MARKER_FILE"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+}
+prepare_tree() {
+    local total_steps=7 current_step=1
+    log_progress "$current_step" "$total_steps"
+    if [[ ! -f "$CLEAN_MARKER_FILE" ]]; then
+        echo -e "${RED}ERROR: You must run Step 1 (Clean Up & Clone) before Step 2 for a safe build!${NC}"
+        return 1
+    fi
+    rm -f "$CLEAN_MARKER_FILE"
+    step_echo "Step 2: Preparing the Build Tree (feeds, firmware, EEPROM)"
+    [ ! -d "$OPENWRT_DIR" ] && echo -e "${RED}Error: '$OPENWRT_DIR' not found. Run Step 1.${NC}" && return 1
+    pushd "$OPENWRT_DIR" >/dev/null
+    step_echo "[2.A] Cleaning duplicate MediaTek feed references"
+    register_feed "$FEED_NAME"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.B] Updating and Installing ALL feeds"
+    ./scripts/feeds update -a
+    ./scripts/feeds install -a
+    echo "All feeds successfully installed."
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.C] Ensuring required patch target directories exist"
+    ensure_patch_directories
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.D] Injecting BE14 EEPROM calibration file only"
+    inject_custom_be14_eeprom
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.E] Removing incompatible cryptsetup host-build patch (if present)"
+    local CRYPT_PATCH="$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
+    [[ -f "$CRYPT_PATCH" ]] && { echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; }
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.F] Running the MediaTek 'prepare' stage"
+    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd; return 1; }
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "[2.G] Check for patch rejects"
+    check_for_patch_rejects "$OPENWRT_DIR"
+    popd >/dev/null
+    echo "Tree preparation and patching completed successfully."
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+}
+apply_config_and_build() {
+    BUILD_START_TIME=$(date +%s)
+    local total_steps=6 current_step=1
+    log_progress "$current_step" "$total_steps"
+    step_echo "Step 3: Applying Final Configuration and Building"
+    [ ! -d "$OPENWRT_DIR" ] && echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
+    pushd "$OPENWRT_DIR" >/dev/null
+    step_echo "Applying builder overlays from contents/my_files and contents/configs..."
+    [ ! -d "$BUILDER_FILES_SRC/my_files" ] || [ ! -d "$BUILDER_FILES_SRC/configs" ] && { echo -e "${RED}Error: Builder subfolders missing at '$BUILDER_FILES_SRC/my_files' or configs.${NC}"; popd; return 1; }
+    safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
+    step_echo "Applying your custom 'files' overlay from contents/files/..."
+    safe_rsync "$DEVICE_FILES_SRC/" "./files/"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "Applying .config file from $LEXY_CONFIG_SRC"
+    cp -v "$LEXY_CONFIG_SRC" ./.config
+    cp -v .config .config.old
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    step_echo "Patching .config for full BE14/RM520NGL-AP router feature set..."
+    patch_config_for_main_be14_router
+    make defconfig
+    compare_configs_warn
+    step_echo "Checking available disk space before building..."
+    check_space
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    # --- Begin Build ---
+    step_echo "Starting final build. Build log is saved to:"
+    echo "    $LOG_FILE"
+    echo
+    make V=sc -j"${PARALLEL_JOBS:-$(nproc)}" 2>&1 | tee -a "$LOG_FILE"
+    popd >/dev/null
+    echo -e "\n\n${NC}##################################################"
+    echo "### Build process completed successfully!      ###"
+    echo "### Find images in '$OPENWRT_DIR/bin/'.        ###"
+    echo "### See log: $LOG_FILE"
+    echo "##################################################"
+    # Post-build: show checksums for new images
+    if [[ -d "$OPENWRT_DIR/bin" ]]; then
+        echo -e "${GREEN}SHA256 of build images:${NC}"
+        find "$OPENWRT_DIR/bin" -type f -exec sha256sum {} +
+    fi
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+    # Timing
+    if [[ $BUILD_START_TIME -ne 0 ]]; then
+        local END_BUILD_TIME=$(date +%s)
+        echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
+    fi
+}
+
+openwrt_shell() {
+    if [ ! -d "$OPENWRT_DIR" ]; then
+        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
+        return 1
+    fi
+    echo "Dropping you into a shell in $OPENWRT_DIR. Type 'exit' to return."
+    pushd "$OPENWRT_DIR" >/dev/null
+    bash
+    popd >/dev/null
+}
+
+openwrt_menuconfig() {
+    if [ ! -d "$OPENWRT_DIR" ]; then
+        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}Launching OpenWrt make menuconfig...${NC}"
+    pushd "$OPENWRT_DIR" >/dev/null
+    make menuconfig
+    popd >/dev/null
+}
+
+show_menu() {
+    echo ""
+    step_echo "BPI-R4 Build Menu (overlays in contents/)"
+    echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
+    echo "------------------------ THE PROCESS -----------------------"
+    echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
+    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, etc.)"
+    echo "3) Apply Final Config & Run Build (make)"
+    echo "------------------------ UTILITIES -------------------------"
+    echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
+    echo "m) OpenWrt make menuconfig"
+    echo "q) Quit"
+    echo ""
+}
+
+### --- CLI OVERRIDES & HELP --- ###
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) SKIP_CONFIRM=1 ;;
+        --all|--batch|--no-menu) MENU_MODE=0; RUN_ALL=1 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
+        --openwrt-tag) OPENWRT_TAG="$2"; shift 2 ;;
+        -h|--help)
+cat <<EOF
+Usage: ./bpi-r4-build-enhanced.sh [options]
+
+General:
+  --all, --batch, --no-menu : Fully automatic build (deletes all previous sources)
+  --force                   : Skip confirmation prompts (dangerous: deletes OpenWrt dir)
+  --profile name            : Use alternate OpenWrt build profile
+  --openwrt-tag vX.Y        : Use specific OpenWrt version/tag (default: openwrt-24.10)
+  --help                    : Show this help/usage
+
+Directory structure:
+  ./contents/   Overlays (my_files/, configs/, files/, mm_config, etc)
+  ./logs/       Build and script logs
+  ./OpenWRT_BPI_R4/bin/  Images built
+
+EOF
+        exit 0
+        ;;
+        *) shift ;;
+    esac
+done
+
+### ===== MAIN ===== ###
+check_required_tools
+check_internet
+install_dependencies
+check_requirements
+
+if [[ $RUN_ALL -eq 1 ]]; then
+    clean_and_clone && prepare_tree && apply_config_and_build
+    END_SCRIPT_TIME=$(date +%s)
+    echo -e "${GREEN}Script completed successfully!${NC}"
+    echo -e "${warn_at_script_end}"
+    echo ""
+    cat <<EOF
+=======================
+Build Complete!
+=======================
+* Built images are inside: $OPENWRT_DIR/bin/
+* Full log: $LOG_FILE
+* Total script time: $((END_SCRIPT_TIME - START_SCRIPT_TIME)) seconds
+
+To flash your device, use the appropriate OpenWrt sysupgrade or recovery method.
+Consult your device's documentation, and see https://openwrt.org/ for more info!
+EOF
+    exit 0
+fi
+
+while (( MENU_MODE )); do
+    trap '' ERR; set +e
+    show_menu
+    read -p "Please select an option: " choice
+    trap on_error ERR; set -e
+    case "$choice" in
+        a|A) clean_and_clone && prepare_tree && apply_config_and_build ;;
+        1) clean_and_clone ;;
+        2) prepare_tree ;;
+        3) apply_config_and_build ;;
+        s|S) openwrt_shell ;;
+        m|M) openwrt_menuconfig ;;
+        q|Q) tput cnorm; END_SCRIPT_TIME=$(date +%s); echo "Exiting script. Log is at $LOG_FILE. Total time: $((END_SCRIPT_TIME - START_SCRIPT_TIME)) seconds"; exit 0 ;;
+        *) echo -e "${RED}Invalid option. Please try again.${NC}";;
+    esac
+done
