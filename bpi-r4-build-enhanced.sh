@@ -258,14 +258,14 @@ clean_and_clone() {
     fi
 
     step_echo "Cloning OpenWrt source code (v24.10.2, shallow clone)..."
-    git clone --branch "$OPENWRT_TAG" --depth 1 "$OPENWRT_REPO" "$OPENWRT_DIR"
+    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_TAG" --depth 1 "$OPENWRT_REPO" "$OPENWRT_DIR"
 
     ((current_step++))
     progress_bar "$current_step" "$total_steps"
     log_progress "$current_step" "$total_steps"
 
     step_echo "Cloning MediaTek feeds INSIDE the OpenWrt directory (shallow clone)..."
-    git clone --depth 1 "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
+    GIT_TERMINAL_PROMPT=0 git clone --progress --depth 1 "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
 
     ((current_step++))
     progress_bar "$current_step" "$total_steps"
