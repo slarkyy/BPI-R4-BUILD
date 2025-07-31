@@ -9,12 +9,11 @@
 #  - Dependency check/installation (Debian/Ubuntu, other OSs: warns)
 #  - CLI overrides: --profile, --openwrt-tag
 #  - Interactive menu + batch/CI/no-menu mode
-#  - Color-coded error output and progress bars
+#  - Color-coded error output
 #  - Pre-flight checks for networking, disk space, tooling, file structure
 #  - Clean repo and patch management
 #  - Logging with timestamped log files in ./logs/
 #  - Post-build checksums for all output images
-#  - GREEN sticky progress bar at bottom during build!
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -122,38 +121,6 @@ step_echo() {
     echo "================================================================="
 }
 log_progress() { echo "Progress: Step $1 of $2"; }
-
-# --- GREEN PROGRESS BAR, STICKY BOTTOM ---
-progress_bar() {
-    local current=$1 total=$2 bar_length=50
-    local percent=$(( 100 * current / total ))
-    (( percent > 100 )) && percent=100
-    local progress=$(( bar_length * percent / 100 ))
-    local green='\033[0;32m'
-    local nc='\033[0m'
-    local rows cols
-    rows=$(tput lines)
-    cols=$(tput cols)
-    tput sc                    # Save position
-    tput cup $((rows-1)) 0     # Move to bottom line
-    printf "${green}[%-${bar_length}s] %3d%%${nc}" "$(printf '#%.0s' $(seq 1 $progress))" "$percent"
-    tput el                    # Clear to end of line
-    tput rc                    # Restore position
-}
-
-# Progress bar is re-drawn after each output line, always at bottom.
-track_build_progress() {
-    local total_tasks=100 progress_count=0
-    trap 'tput cnorm; exit' INT
-    make V=sc -j"${PARALLEL_JOBS:-$(nproc)}" 2>&1 | tee -a "$LOG_FILE" | while IFS= read -r line; do
-        echo "$line"
-        [[ "$line" == *"Entering directory"* ]] && progress_count=$((progress_count+1))
-        ((progress_count > total_tasks)) && progress_count=$total_tasks
-        progress_bar "$progress_count" "$total_tasks"
-    done
-    progress_bar "$total_tasks" "$total_tasks"
-    echo
-}
 
 ### --- PREREQ, INTERNET, DEPS --- ###
 check_required_tools() {
@@ -410,7 +377,7 @@ apply_config_and_build() {
     step_echo "Starting final build. Build log is saved to:"
     echo "    $LOG_FILE"
     echo
-    track_build_progress
+    make V=sc -j"${PARALLEL_JOBS:-$(nproc)}" 2>&1 | tee -a "$LOG_FILE"
     cd "$SCRIPT_DIR"
     echo -e "\n\n${NC}##################################################"
     echo "### Build process completed successfully!      ###"
@@ -437,55 +404,4 @@ openwrt_shell() {
 }
 
 show_menu() {
-    echo ""
-    step_echo "BPI-R4 Build Menu (overlays in contents/)"
-    echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
-    echo "------------------------ THE PROCESS -----------------------"
-    echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
-    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, etc.)"
-    echo "3) Apply Final Config & Run Build (make)"
-    echo "------------------------ UTILITIES -------------------------"
-    echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
-    echo "q) Quit"
-    echo ""
-}
-
-### ===== MAIN ===== ###
-check_required_tools
-check_internet
-install_dependencies
-check_requirements
-
-if [[ $RUN_ALL -eq 1 ]]; then
-    clean_and_clone && prepare_tree && apply_config_and_build
-    echo -e "${GREEN}Script completed successfully!${NC}"
-    echo -e "${warn_at_script_end}"
-    echo ""
-    cat <<EOF
-=======================
-Build Complete!
-=======================
-* Built images are inside: $OPENWRT_DIR/bin/
-* Full log: $LOG_FILE
-
-To flash your device, use the appropriate OpenWrt sysupgrade or recovery method.
-Consult your device's documentation, and see https://openwrt.org/ for more info!
-EOF
-    exit 0
-fi
-
-while (( MENU_MODE )); do
-    trap '' ERR; set +e
-    show_menu
-    read -p "Please select an option: " choice
-    trap on_error ERR; set -e
-    case $choice in
-        a|A) clean_and_clone && prepare_tree && apply_config_and_build ;;
-        1) clean_and_clone ;;
-        2) prepare_tree ;;
-        3) apply_config_and_build ;;
-        s|S) openwrt_shell ;;
-        q|Q) tput cnorm; echo "Exiting script. Log is at $LOG_FILE"; exit 0 ;;
-        *) echo -e "${RED}Invalid option. Please try again.${NC}";;
-    esac
-done
+    echo
