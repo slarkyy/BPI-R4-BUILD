@@ -404,4 +404,55 @@ openwrt_shell() {
 }
 
 show_menu() {
-    echo
+    echo ""
+    step_echo "BPI-R4 Build Menu (overlays in contents/)"
+    echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
+    echo "------------------------ THE PROCESS -----------------------"
+    echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
+    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, etc.)"
+    echo "3) Apply Final Config & Run Build (make)"
+    echo "------------------------ UTILITIES -------------------------"
+    echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
+    echo "q) Quit"
+    echo ""
+}
+
+### ===== MAIN ===== ###
+check_required_tools
+check_internet
+install_dependencies
+check_requirements
+
+if [[ $RUN_ALL -eq 1 ]]; then
+    clean_and_clone && prepare_tree && apply_config_and_build
+    echo -e "${GREEN}Script completed successfully!${NC}"
+    echo -e "${warn_at_script_end}"
+    echo ""
+    cat <<EOF
+=======================
+Build Complete!
+=======================
+* Built images are inside: $OPENWRT_DIR/bin/
+* Full log: $LOG_FILE
+
+To flash your device, use the appropriate OpenWrt sysupgrade or recovery method.
+Consult your device's documentation, and see https://openwrt.org/ for more info!
+EOF
+    exit 0
+fi
+
+while (( MENU_MODE )); do
+    trap '' ERR; set +e
+    show_menu
+    read -p "Please select an option: " choice
+    trap on_error ERR; set -e
+    case $choice in
+        a|A) clean_and_clone && prepare_tree && apply_config_and_build ;;
+        1) clean_and_clone ;;
+        2) prepare_tree ;;
+        3) apply_config_and_build ;;
+        s|S) openwrt_shell ;;
+        q|Q) tput cnorm; echo "Exiting script. Log is at $LOG_FILE"; exit 0 ;;
+        *) echo -e "${RED}Invalid option. Please try again.${NC}";;
+    esac
+done
