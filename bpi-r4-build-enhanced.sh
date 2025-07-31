@@ -1,11 +1,8 @@
 #!/bin/bash
 
-# BPI-R4 OpenWrt/MediaTek Build Automation Script (OpenWrt 24.10.2 Release)
-# Maintainer: Luke
-
 set -euo pipefail
 
-# --- Install ALL Build Dependencies ---
+# --- Install Dependencies ---
 install_dependencies() {
   echo "Checking and installing dependencies..."
   packages=(
@@ -24,28 +21,26 @@ install_dependencies() {
   done
 }
 
-# --- Progress Bar (always at top of terminal) ---
+# --- Progress Bar (only for BUILD, not menu/interaction) ---
 progress_bar() {
   local current=$1 total=$2 bar_length=50
   local percent=$(( 100 * current / total ))
   (( percent > 100 )) && percent=100
   local progress=$(( bar_length * percent / 100 ))
-  tput civis          # hide cursor
-  tput cup 0 0        # top left
-  printf "[%-${bar_length}s] %3d%%" "$(printf '#%.0s' $(seq 1 $progress))" "$percent"
-  tput cup 1 0        # output below bar goes here
-  tput cnorm          # show cursor
-}
-log_progress() {
-  local current_step=$1 total_steps=$2
-  tput cup 1 0 && printf "Progress: Step %s of %s\n" "$current_step" "$total_steps"
-  tput cup 2 0
+
+  tput civis
+  tput cup 0 0
+  printf "[%-${bar_length}s] %3d%%\n" "$(printf '#%.0s' $(seq 1 $progress))" "$percent"
+  tput cnorm
 }
 
-# Simulate tracking build progress (kernel build)
+log_progress() {
+  local current_step=$1 total_steps=$2
+  echo "Progress: Step $current_step of $total_steps"
+}
+
 track_build_progress() {
-  local total_tasks=100
-  local progress_count=0
+  local total_tasks=100 progress_count=0
   make V=sc -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" | while read -r line; do
     echo "$line"
     [[ "$line" == *"Entering directory"* ]] && progress_count=$((progress_count+1))
@@ -99,15 +94,13 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 # --- Helper Functions ---
 step_echo() {
-  tput cup 3 0
   echo "================================================================="
   echo "=> $1"
   echo "================================================================="
 }
 
 check_space() {
-  local avail
-  avail=$(df --output=avail "$REPO_ROOT" | tail -1)
+  local avail=$(df --output=avail "$REPO_ROOT" | tail -1)
   local avail_gb=$((avail/1024/1024))
   if [[ "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
     echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk on $REPO_ROOT. (Available: ${avail_gb}GB)${NC}"
@@ -131,8 +124,8 @@ check_requirements() {
 safe_rsync() {
   local SRC="$1"
   local DST="$2"
-  rsync -a --delete --info=progress2 "$SRC" "$DST"
-  [[ $? -ne 0 ]] && { echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"; exit 1; }
+  rsync -a --delete --info=progress2 "$SRC" "$DST" || {
+    echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"; exit 1; }
 }
 
 register_feed() {
@@ -149,10 +142,8 @@ ensure_patch_directories() {
 inject_custom_be14_eeprom() {
   local eeprom_src="$EEPROM_BLOB"
   local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/$DEST_EEPROM_NAME"
-  local fw_dir
-  fw_dir="$(dirname "$eeprom_dst")"
   [[ ! -f "$eeprom_src" ]] && { echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"; exit 1; }
-  mkdir -p "$fw_dir"
+  mkdir -p "$(dirname "$eeprom_dst")"
   cp -af "$eeprom_src" "$eeprom_dst"
   echo "Copied EEPROM as $eeprom_dst"
 }
@@ -222,10 +213,8 @@ check_for_patch_rejects() {
 
 # --- Build Steps ---
 clean_and_clone() {
-  local total_steps=4
-  local current_step=1
+  local total_steps=4 current_step=1
   log_progress "$current_step" "$total_steps"
-  progress_bar "$current_step" "$total_steps"
   step_echo "Step 1: Clean Up & Clone Repos into a Fresh Directory"
   rm -rf "$OPENWRT_DIR"
   rm -f "$CLEAN_MARKER_FILE"
@@ -235,24 +224,20 @@ clean_and_clone() {
   else
     echo "(--force: Skipping confirmation prompt for cleanup.)"
   fi
-
   step_echo "Cloning OpenWrt source code (v24.10.2, shallow clone)..."
   GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_TAG" --depth 1 "$OPENWRT_REPO" "$OPENWRT_DIR"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
-
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "Cloning MediaTek feeds INSIDE the OpenWrt directory (shallow clone)..."
   GIT_TERMINAL_PROMPT=0 git clone --progress --depth 1 "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
-
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   echo "Cloning complete."
   touch "$CLEAN_MARKER_FILE"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
 }
 
 prepare_tree() {
-  local total_steps=7
-  local current_step=1
-  log_progress "$current_step" "$total_steps"; progress_bar "$current_step" "$total_steps"
+  local total_steps=7 current_step=1
+  log_progress "$current_step" "$total_steps"
   if [[ ! -f "$CLEAN_MARKER_FILE" ]]; then
     echo -e "${RED}ERROR: You must run Step 1 (Clean Up & Clone) before Step 2 for a safe build!${NC}"
     return 1
@@ -263,56 +248,55 @@ prepare_tree() {
   cd "$OPENWRT_DIR"
   step_echo "[2.A] Cleaning duplicate MediaTek feed references"
   register_feed "$FEED_NAME"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.B] Updating and Installing ALL feeds"
   ./scripts/feeds update -a
   ./scripts/feeds install -a
   echo "All feeds successfully installed."
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.C] Ensuring required patch target directories exist"
   ensure_patch_directories
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.D] Injecting BE14 EEPROM calibration file only"
   inject_custom_be14_eeprom
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.E] Removing incompatible cryptsetup host-build patch (if present)"
   local CRYPT_PATCH="$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
   [[ -f "$CRYPT_PATCH" ]] && { echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; }
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.F] Running the MediaTek 'prepare' stage"
   bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; return 1; }
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "[2.G] Check for patch rejects"
   check_for_patch_rejects "$OPENWRT_DIR"
   cd "$SCRIPT_DIR"
   echo "Tree preparation and patching completed successfully."
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
 }
 
 apply_config_and_build() {
-  local total_steps=6
-  local current_step=1
-  log_progress "$current_step" "$total_steps"; progress_bar "$current_step" "$total_steps"
+  local total_steps=6 current_step=1
+  log_progress "$current_step" "$total_steps"
   step_echo "Step 3: Applying Final Configuration and Building"
   [ ! -d "$OPENWRT_DIR" ] && echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
   cd "$OPENWRT_DIR"
   step_echo "Applying builder overlays from contents/my_files and contents/configs..."
   [ ! -d "$BUILDER_FILES_SRC/my_files" ] || [ ! -d "$BUILDER_FILES_SRC/configs" ] && { echo -e "${RED}Error: Builder subfolders missing at '$BUILDER_FILES_SRC/my_files' or configs.${NC}"; return 1; }
   safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
   step_echo "Applying your custom 'files' overlay from contents/files/..."
   safe_rsync "$DEVICE_FILES_SRC/" "./files/"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "Applying .config file from $LEXY_CONFIG_SRC"
   cp -v "$LEXY_CONFIG_SRC" ./.config
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   step_echo "Patching .config for full BE14/RM520NGL-AP router feature set..."
   patch_config_for_main_be14_router
   make defconfig
   step_echo "Checking available disk space before building..."
   check_space
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
   # --- Begin Build ---
   step_echo "Starting final build. Build log is saved to:"
   echo "    $LOG_FILE"
@@ -324,7 +308,7 @@ apply_config_and_build() {
   echo "### Find images in '$OPENWRT_DIR/bin/'.        ###"
   echo "### See log: $LOG_FILE"
   echo "##################################################"
-  ((current_step++)); progress_bar "$current_step" "$total_steps"; log_progress "$current_step" "$total_steps"
+  ((current_step++)); log_progress "$current_step" "$total_steps"
 }
 
 openwrt_shell() {
@@ -339,7 +323,6 @@ openwrt_shell() {
 }
 
 show_menu() {
-  tput cup 0 0
   echo ""
   step_echo "BPI-R4 Build Menu (overlays in contents/)"
   echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
