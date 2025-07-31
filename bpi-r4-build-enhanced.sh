@@ -200,6 +200,22 @@ inject_custom_be14_eeprom() {
     echo "Copied EEPROM as $eeprom_dst"
 }
 
+apply_yukariin_patch() {
+    local PATCH_SRC="$CONTENTS_DIR/001-Add-tx_power-check-Yukariin.patch"
+    local TARGET_DIR="$OPENWRT_DIR/package/kernel/mt76/patches/"
+    if [[ ! -f "$PATCH_SRC" ]]; then
+        echo -e "${RED}WARNING: Patch $PATCH_SRC not found, skipping Yukariin patch!${NC}"
+        return 0
+    fi
+    if [[ ! -d "$TARGET_DIR" ]]; then
+        echo "Creating missing patch directory: $TARGET_DIR"
+        mkdir -p "$TARGET_DIR"
+    fi
+    local PATCH_DST="$TARGET_DIR/$(basename "$PATCH_SRC")"
+    cp -af "$PATCH_SRC" "$PATCH_DST"
+    echo "Yukariin patch copied to $PATCH_DST"
+}
+
 patch_config_for_main_be14_router() {
     local config_file="$OPENWRT_DIR/.config"
     [[ ! -f "$config_file" ]] && { echo -e "${RED}ERROR: Could not patch .config (file not found at $config_file)!${NC}"; exit 8; }
@@ -282,154 +298,6 @@ ensure_stdc_predef_in_toolchain() {
         cp -f "$src" "$toolchain_inc_dir/"
     done
 }
-
-clean_and_clone() {
-    local total_steps=4 current_step=1
-    log_progress "$current_step" "$total_steps"
-    step_echo "Step 1: Clean Up & Clone Repos into a Fresh Directory"
-    protect_dir_safety "$OPENWRT_DIR"
-    if [[ "$SKIP_CONFIRM" == "0" ]]; then
-        read -p "This will DELETE the '$OPENWRT_DIR' directory (if it exists). Continue? (y/n) " -n 1 -r ; echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Operation cancelled."; return 1; fi
-    else
-        echo "(--force: Skipping confirmation prompt for cleanup.)"
-    fi
-    nuke_dir_forcefully "$OPENWRT_DIR"
-    rm -f "$CLEAN_MARKER_FILE"
-
-    step_echo "Cloning OpenWrt source code ($OPENWRT_TAG, full clone)..."
-    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_TAG" "$OPENWRT_REPO" "$OPENWRT_DIR"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-
-    step_echo "Cloning MediaTek feeds at commit $MTK_FEEDS_COMMIT (full clone)..."
-    # Use script TTY for progress bar if available
-    if command -v script >/dev/null 2>&1; then
-        GIT_TERMINAL_PROMPT=0 script -q -c "git clone --progress '$MTK_REPO' '$OPENWRT_DIR/$FEED_PATH'" /dev/null
-    else
-        echo "script utility not found, falling back to non-TTY git clone. If no progress is shown, install 'script' from util-linux for progress meter."
-        GIT_TERMINAL_PROMPT=0 git clone --progress "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
-    fi
-    (
-        cd "$OPENWRT_DIR/$FEED_PATH"
-        git checkout "$MTK_FEEDS_COMMIT"
-    )
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    echo "Cloning complete."
-    touch "$CLEAN_MARKER_FILE"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-}
-
-prepare_tree() {
-    local total_steps=7 current_step=1
-    log_progress "$current_step" "$total_steps"
-    # Allow running if $OPENWRT_DIR looks valid!
-    if [[ ! -d "$OPENWRT_DIR" ]] || [[ ! -f "$OPENWRT_DIR/feeds.conf.default" ]] || [[ ! -f "$OPENWRT_DIR/Makefile" ]] || [[ ! -x "$OPENWRT_DIR/scripts/feeds" ]]; then
-        echo -e "${RED}ERROR: OpenWrt source missing or broken at '$OPENWRT_DIR'. Please run Step 1 to clone.&{NC}"
-        return 1
-    fi
-    if [[ -f "$CLEAN_MARKER_FILE" ]]; then
-        rm -f "$CLEAN_MARKER_FILE"
-    else
-        echo -e "${GREEN}Note:${NC} '$OPENWRT_DIR' exists and looks OK. Continuing Step 2 without re-cloning."
-    fi
-    step_echo "Step 2: Preparing the Build Tree (feeds, firmware, EEPROM)"
-    pushd "$OPENWRT_DIR" >/dev/null
-    step_echo "[2.A] Cleaning duplicate MediaTek feed references"
-    register_feed "$FEED_NAME"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.B] Updating and Installing ALL feeds"
-    ./scripts/feeds update -a
-    ./scripts/feeds install -a
-    echo "All feeds successfully installed."
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.C] Ensuring required patch target directories exist"
-    ensure_patch_directories
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.D] Injecting BE14 EEPROM calibration file only"
-    inject_custom_be14_eeprom
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.E] Removing incompatible cryptsetup host-build patch (if present)"
-    local CRYPT_PATCH="$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
-    [[ -f "$CRYPT_PATCH" ]] && { echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; }
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.F] Running the MediaTek 'prepare' stage"
-    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd; return 1; }
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "[2.G] Check for patch rejects"
-    check_for_patch_rejects "$OPENWRT_DIR"
-    popd >/dev/null
-    echo "Tree preparation and patching completed successfully."
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-}
-
-apply_config_and_build() {
-    BUILD_START_TIME=$(date +%s)
-    local total_steps=6 current_step=1
-    log_progress "$current_step" "$total_steps"
-    step_echo "Step 3: Applying Final Configuration and Building"
-    [ ! -d "$OPENWRT_DIR" ] && echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
-    pushd "$OPENWRT_DIR" >/dev/null
-    step_echo "Applying builder overlays from contents/my_files and contents/configs..."
-    [ ! -d "$BUILDER_FILES_SRC/my_files" ] || [ ! -d "$BUILDER_FILES_SRC/configs" ] && { echo -e "${RED}Error: Builder subfolders missing at '$BUILDER_FILES_SRC/my_files' or configs.${NC}"; popd; return 1; }
-    safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
-    step_echo "Applying your custom 'files' overlay from contents/files/..."
-    safe_rsync "$DEVICE_FILES_SRC/" "./files/"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "Applying .config file from $LEXY_CONFIG_SRC"
-    cp -v "$LEXY_CONFIG_SRC" ./.config
-    cp -v .config .config.old
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "Patching .config for full BE14/RM520NGL-AP router feature set..."
-    patch_config_for_main_be14_router
-    make defconfig
-    compare_configs_warn
-    step_echo "Checking available disk space before building..."
-    check_space
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-
-    # PATCH: Fix for stdc-predef.h missing in cross toolchain sysroot(s)
-    ensure_stdc_predef_in_toolchain
-
-    # --- Begin Build ---
-    step_echo "Starting final build. Build log is saved to:"
-    echo "    $LOG_FILE"
-    echo
-    make V=sc -j"${PARALLEL_JOBS:-$(nproc)}" 2>&1 | tee -a "$LOG_FILE"
-    popd >/dev/null
-    echo -e "\n\n${NC}##################################################"
-    echo "### Build process completed successfully!      ###"
-    echo "### Find images in '$OPENWRT_DIR/bin/'.        ###"
-    echo "### See log: $LOG_FILE"
-    echo "##################################################"
-    if [[ -d "$OPENWRT_DIR/bin" ]]; then
-        echo -e "${GREEN}SHA256 of build images:${NC}"
-        find "$OPENWRT_DIR/bin" -type f -exec sha256sum {} +
-    fi
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    if [[ $BUILD_START_TIME -ne 0 ]]; then
-        local END_BUILD_TIME=$(date +%s)
-        echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
-    fi
-}
-
-openwrt_shell() {
-    if [ ! -d "$OPENWRT_DIR" ]; then
-        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
-        return 1
-    fi
-    echo "Dropping you into a shell in $OPENWRT_DIR. Type 'exit' to return."
-    pushd "$OPENWRT_DIR" >/dev/null
-    bash
-    popd >/dev/null
-}
-
-openwrt_menuconfig() {
-    if [ ! -d "$OPENWRT_DIR" ]; then
-        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
-        return 1
-    fi
     echo -e "${GREEN}Launching OpenWrt make menuconfig...${NC}"
     pushd "$OPENWRT_DIR" >/dev/null
     make menuconfig
