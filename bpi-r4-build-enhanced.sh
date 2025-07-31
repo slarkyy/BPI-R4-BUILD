@@ -5,8 +5,7 @@ set -euo pipefail
 GREEN='\033[1;32m'
 NC='\033[0m'
 
-# --- Global progress vars
-TOTAL_STEPS=53    # 3 main steps + build (50 build ticks)
+TOTAL_STEPS=53    # 3 major steps (clone, prepare, config-apply) + 50 build ticks
 CURRENT_STEP=0
 
 # --- Install Dependencies ---
@@ -28,7 +27,6 @@ install_dependencies() {
   done
 }
 
-# --- Green Progress Bar on Bottom Line ---
 progress_bar() {
   local current=$1 total=$2 bar_length=50
   local percent=$(( 100 * current / total ))
@@ -39,13 +37,11 @@ progress_bar() {
   printf "${GREEN}[%-${bar_length}s] %3d%%${NC}" "$(printf '#%.0s' $(seq 1 $progress))" "$percent"
   tput cnorm
 }
-
 bump_progress() {
   ((CURRENT_STEP++))
   (( CURRENT_STEP > TOTAL_STEPS )) && CURRENT_STEP=$TOTAL_STEPS
   progress_bar "$CURRENT_STEP" "$TOTAL_STEPS"
 }
-
 log_progress() { echo "Progress: Step $CURRENT_STEP of $TOTAL_STEPS"; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -170,16 +166,23 @@ check_for_patch_rejects() {
   fi
 }
 
+# -- Build Steps, with progress bumps --
 clean_and_clone() {
   step_echo "Clean Up & Clone Repos"
   rm -rf "$OPENWRT_DIR"
+  bump_progress
   rm -f "$CLEAN_MARKER_FILE"
-  [[ "$SKIP_CONFIRM" == "0" ]] && { read -p "This will delete '$OPENWRT_DIR'. Continue? (y/n) " -n 1 -r; echo; [[ ! $REPLY =~ ^[Yy]$ ]] && echo "Operation cancelled." && exit 1; }
+  bump_progress
+  if [[ "$SKIP_CONFIRM" == "0" ]]; then
+    read -p "This will delete '$OPENWRT_DIR'. Continue? (y/n) " -n 1 -r; echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Operation cancelled."; exit 1; fi
+  fi
   step_echo "Cloning OpenWrt..."
   GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_TAG" --depth 1 "$OPENWRT_REPO" "$OPENWRT_DIR"
   bump_progress
   step_echo "Cloning MediaTek feeds (shallow)..."
   GIT_TERMINAL_PROMPT=0 git clone --progress --depth 1 "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
+  bump_progress
   echo "Cloning complete."
   touch "$CLEAN_MARKER_FILE"
   bump_progress
@@ -216,7 +219,7 @@ apply_config_and_build() {
   patch_config_for_main_be14_router; make defconfig; bump_progress
   check_space; bump_progress
 
-  # --- Begin Build, subdivide ticks for smooth bar ---
+  # --- Begin Build, smooth bar ---
   step_echo "Starting build (make)..."
   local build_ticks=50
   for ((progress_here=1; progress_here<=build_ticks; progress_here++)); do
@@ -271,8 +274,13 @@ while true; do
   read -p "Please select an option: " choice
   trap on_error ERR; set -e
   case $choice in
-    a|A) CURRENT_STEP=0; clean_and_clone; prepare_tree; apply_config_and_build ;;
-    1) CURRENT_STEP=0; clean_and_clone ;;
+    a|A)
+      CURRENT_STEP=0
+      clean_and_clone
+      prepare_tree
+      apply_config_and_build
+      ;;
+    1) clean_and_clone ;;
     2) prepare_tree ;;
     3) apply_config_and_build ;;
     s|S) openwrt_shell ;;
