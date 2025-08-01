@@ -1,9 +1,8 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ===========================================================================
-#  BPI-R4 / Mediatek OpenWrt Builder Script (fully outlier enhanced)
+#  BPI-R4 / Mediatek OpenWrt Builder Script (Outlier enhanced, v3)
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -15,7 +14,7 @@ REPO_ROOT="$SCRIPT_DIR"
 LOGS_DIR="$REPO_ROOT/logs"
 CONTENTS_DIR="$REPO_ROOT/contents"
 OPENWRT_DIR="$REPO_ROOT/OpenWRT_BPI_R4"
-PROFILE_DEFAULT="filogic-mac80211-mt7988_rfb-mt7996"
+PROFILE_DEFAULT="mt7988_rfb"
 LEXY_CONFIG_SRC="$CONTENTS_DIR/mm_config"
 DEVICE_FILES_SRC="$CONTENTS_DIR/files"
 BUILDER_FILES_SRC="$CONTENTS_DIR"
@@ -38,25 +37,34 @@ SKIP_CONFIRM=0
 MENU_MODE=1
 RUN_ALL=0
 PROFILE="$PROFILE_DEFAULT"
-warn_at_script_end=""
+ALLOW_ROOT=0
+warn_at_script_end=()
 DATE_TAG=$(date +"%Y-%m-%d_%H-%M-%S")
 START_SCRIPT_TIME=$(date +%s)
 BUILD_START_TIME=0
+
+PER_STEP_TIMING=0   # set to 1 to track per-step durations
 
 cleanup() { tput cnorm || true; }
 trap cleanup EXIT
 
 require_folder() {
     local dir="$1"
-    [[ -d "$dir" ]] || { echo -e "${RED}ERROR: Required directory not found: $dir${NC}"; exit 1; }
+    if [[ ! -d "$dir" ]]; then
+        echo -e "${RED}ERROR: Required directory not found: $dir${NC}"
+        exit 1
+    fi
 }
 require_file() {
     local f="$1"
-    [[ -f "$f" ]] || { echo -e "${RED}ERROR: Required file not found: $f${NC}"; exit 1; }
+    if [[ ! -f "$f" ]]; then
+        echo -e "${RED}ERROR: Required file not found: $f${NC}"
+        exit 1
+    fi
 }
 protect_dir_safety() {
     local tgt="$1"
-    if [[ "$tgt" == "/" || "$tgt" =~ ^/root/?$ || "$tgt" =~ ^/home/?$ || "$tgt" == "" ]]; then
+    if [[ "$tgt" == "/" || "$tgt" =~ ^/root/?$ || "$tgt" =~ ^/home/?$ || -z "$tgt" ]]; then
         echo -e "${RED}Refusing to delete critical system directory: $tgt${NC}"
         exit 99
     fi
@@ -74,9 +82,9 @@ nuke_dir_forcefully() {
     fi
 }
 
-if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    echo -e "${RED}WARNING: Running as root is NOT recommended!${NC}" >&2
-    sleep 1
+if [[ "${EUID:-$(id -u)}" -eq 0 && "$ALLOW_ROOT" -eq 0 ]]; then
+    echo -e "${RED}Refusing to run as root! Use --allow-root only if you understand the risks.${NC}" >&2
+    exit 100
 fi
 
 mkdir -p "$LOGS_DIR"
@@ -91,17 +99,27 @@ on_error() {
     echo -e "${RED}# Error on line $LINENO: Command '$BASH_COMMAND' exited with status $exit_code.${NC}"
     echo -e "${RED}##########################################################${NC}"
     echo "Review the build log for diagnostics:"
-    [[ -f "$LOG_FILE" ]] && echo "   $LOG_FILE"
-    exit $exit_code
+    if [[ -f "$LOG_FILE" ]]; then echo "   $LOG_FILE"; fi
+    exit "$exit_code"
 }
 trap on_error ERR INT
 
 step_echo() {
-    echo "================================================================="
-    echo "=> $1"
-    echo "================================================================="
+    echo -e "${GREEN}=================================================================${NC}"
+    echo -e "${GREEN}=> $1${NC}"
+    echo -e "${GREEN}=================================================================${NC}"
 }
+
 log_progress() { echo "Progress: Step $1 of $2"; }
+
+step_timer_start=0
+step_time_print() {
+    if [[ "$PER_STEP_TIMING" -eq 1 && "$step_timer_start" -gt 0 ]]; then
+        local now; now=$(date +%s)
+        echo -e "${GREEN}Step duration: $((now-step_timer_start)) seconds${NC}"
+    fi
+    step_timer_start=$(date +%s)
+}
 
 check_required_tools() {
     echo "Checking for required tools..."
@@ -130,7 +148,7 @@ install_dependencies() {
     echo "Checking dependencies (Debian/Ubuntu only)..."
     if [[ ! -f "/etc/debian_version" ]]; then
         echo -e "${RED}WARN: Dependency install only works for Debian/Ubuntu. Please ensure build requirements are met manually!${NC}"
-        warn_at_script_end+="\n* You may need to install OpenWrt build dependencies manually on your platform!"
+        warn_at_script_end+=("\n* You may need to install OpenWrt build dependencies manually on your platform!")
         return
     fi
     packages=(
@@ -144,9 +162,9 @@ install_dependencies() {
             missing_packages+=("$package")
         fi
     done
-    if [ ${#missing_packages[@]} -ne 0 ]; then
+    if [[ ${#missing_packages[@]} -ne 0 ]]; then
         echo "The following packages are missing and will be installed: ${missing_packages[*]}"
-        if [ -z "${SKIP_CONFIRM+x}" ] || [ "$SKIP_CONFIRM" -eq 0 ]; then
+        if [[ -z "${SKIP_CONFIRM+x}" || "$SKIP_CONFIRM" -eq 0 ]]; then
             read -p "Install missing packages with sudo? Continue? (y/n) " -n 1 -r ; echo
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
                 echo "User cancelled dependency installation."
@@ -165,6 +183,7 @@ check_requirements() {
     require_folder "$BUILDER_FILES_SRC/configs"
     require_folder "$DEVICE_FILES_SRC"
     require_file "$LEXY_CONFIG_SRC"
+    local EEPROM_BLOBS
     EEPROM_BLOBS=($(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin'))
     if [[ ${#EEPROM_BLOBS[@]} -eq 0 ]]; then
         echo -e "${RED}ERROR: No EEPROM *.bin found at $CONTENTS_DIR${NC}"
@@ -188,8 +207,27 @@ check_space() {
 safe_rsync() {
     local SRC="$1"
     local DST="$2"
-    rsync -a --delete --info=progress2 "$SRC" "$DST" || {
-        echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"; exit 6; }
+    if ! rsync -a --delete --info=progress2 "$SRC" "$DST"; then
+        echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"
+        exit 6
+    fi
+}
+
+validate_profile() {
+    # Only run after $OPENWRT_DIR is present.
+    # Check for the existence of the profile for autobuild
+    if [[ ! -d "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic" ]]; then
+        echo -e "${RED}ERROR: Unable to validate profile (directory structure missing)${NC}"
+        return 1
+    fi
+    local valid_profiles
+    valid_profiles=($(find "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic" -maxdepth 1 -type d -name "${PROFILE}*" -printf "%f\n"))
+    if [[ "${#valid_profiles[@]}" -eq 0 ]]; then
+        echo -e "${RED}ERROR: Profile '$PROFILE' does not appear to be valid.${NC}"
+        echo "Check the available profiles in '$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/'"
+        exit 21
+    fi
+    # else OK
 }
 
 apply_wireless_regdb_patches() {
@@ -203,14 +241,22 @@ remove_strongswan_patch() {
     rm -rf "$OPENWRT_DIR/$FEED_PATH/24.10/patches-feeds/108-strongswan-add-uci-support.patch"
 }
 add_noise_fix_patch() {
+    mkdir -p "$OPENWRT_DIR/package/network/utils/iwinfo/patches/"
     \cp -r "$BUILDER_FILES_SRC/my_files/200-v.kosikhin-libiwinfo-fix_noise_reading_for_radios.patch" "$OPENWRT_DIR/package/network/utils/iwinfo/patches/"
 }
 add_tx_power_patches() {
-    \cp -r "$BUILDER_FILES_SRC/my_files/99999_tx_power_check.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/9997-use-tx_power-from-default-fw-if-EEPROM-contains-0s.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
+   mkdir -p "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
+   \cp -r "$BUILDER_FILES_SRC/my_files/99999_tx_power_check.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
+   \cp -r "$BUILDER_FILES_SRC/my_files/9997-use-tx_power-from-default-fw-if-EEPROM-contains-0s.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
 }
 apply_additional_mtk_patches() {
     local f="$OPENWRT_DIR/$FEED_PATH"
+    mkdir -p "$f/24.10/files/target/linux/mediatek/patches-6.6/"
+    mkdir -p "$f/autobuild/unified/filogic/24.10/patches-feeds/"
+    mkdir -p "$f/feed/kernel/crypto-eip/src/"
+    mkdir -p "$f/24.10/patches-base/"
+    mkdir -p "$f/autobuild/unified/filogic/24.10/files/scripts/make-squashfs-hashed.sh"
+    mkdir -p "$f/24.10/files/target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/"
     rm -rf "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_eth_reset.c"
     rm -rf "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_eth_reset.h"
     \cp -r "$BUILDER_FILES_SRC/my_files/mtk_eth_reset.c"  "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/"
@@ -238,12 +284,15 @@ disable_perf() {
     sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/autobuild_5.4_mac80211_release/mt7988_wifi7_mac80211_mlo/.config" || true
     sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/autobuild_5.4_mac80211_release/mt7986_mac80211/.config" || true
 }
-
 inject_custom_be14_eeprom() {
+    local EEPROM_BLOBS
     EEPROM_BLOBS=($(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin'))
     local eeprom_src="${EEPROM_BLOBS[0]}"
     local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/$DEST_EEPROM_NAME"
-    [[ ! -f "$eeprom_src" ]] && { echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"; exit 7; }
+    if [[ ! -f "$eeprom_src" ]]; then
+        echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"
+        exit 7
+    fi
     mkdir -p "$(dirname "$eeprom_dst")"
     cp -af "$eeprom_src" "$eeprom_dst"
     echo "Copied EEPROM as $eeprom_dst"
@@ -253,6 +302,7 @@ clean_and_clone() {
     local total_steps=4 current_step=1
     log_progress "$current_step" "$total_steps"
     step_echo "Step 1: Nuke OpenWrt and MediaTek feeds directories, then clone fresh"
+    step_time_print
 
     local openwrt="$OPENWRT_DIR"
     local mtkfeeds="$OPENWRT_DIR/$FEED_PATH"
@@ -273,6 +323,7 @@ clean_and_clone() {
 
     ((current_step++)); log_progress "$current_step" "$total_steps"
     step_echo "Cloning OpenWrt source (branch ${OPENWRT_BRANCH}, commit ${OPENWRT_COMMIT})..."
+    step_time_print
     GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$openwrt"
     (
         cd "$openwrt"
@@ -281,6 +332,7 @@ clean_and_clone() {
     ((current_step++)); log_progress "$current_step" "$total_steps"
 
     step_echo "Cloning MediaTek feeds (branch ${MTK_BRANCH}, commit ${MTK_COMMIT})..."
+    step_time_print
     GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$MTK_BRANCH" "$MTK_REPO" "$mtkfeeds"
     (
         cd "$mtkfeeds"
@@ -297,7 +349,7 @@ clean_and_clone() {
 }
 
 prepare_tree() {
-    local total_steps=8 current_step=1
+    local total_steps=9 current_step=1
     log_progress "$current_step" "$total_steps"
     if [[ ! -d "$OPENWRT_DIR" ]] || [[ ! -f "$OPENWRT_DIR/feeds.conf.default" ]] || [[ ! -f "$OPENWRT_DIR/Makefile" ]] || [[ ! -x "$OPENWRT_DIR/scripts/feeds" ]]; then
         echo -e "${RED}ERROR: OpenWrt source missing or broken at '$OPENWRT_DIR'. Please run Step 1 to clone.${NC}"
@@ -308,17 +360,18 @@ prepare_tree() {
     else
         echo -e "${GREEN}Note:${NC} '$OPENWRT_DIR' exists and looks OK. Continuing Step 2 without re-cloning."
     fi
-    step_echo "Step 2: Preparing the Build Tree (feeds, overlays, patches, etc)"
+    step_echo "Step 2: Preparing the Build Tree (feeds, overlays, patches, config, EEPROM, etc)"
+    step_time_print
     pushd "$OPENWRT_DIR" >/dev/null
 
     step_echo "[2.A] Cleaning duplicate MediaTek feed references"
     sed -i "/$FEED_NAME/d" feeds.conf.default
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
     step_echo "[2.B] Updating and Installing ALL feeds"
     ./scripts/feeds update -a
     ./scripts/feeds install -a
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
     step_echo "[2.C] Applying builder overlays from contents/my_files, configs and files"
     require_folder "$BUILDER_FILES_SRC/my_files"
@@ -327,62 +380,68 @@ prepare_tree() {
     safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
     require_folder "$DEVICE_FILES_SRC"
     safe_rsync "$DEVICE_FILES_SRC/" "./files/"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
-    step_echo "[2.D] Applying all custom/required patches and files..."
+    step_echo "[2.D] Injecting custom EEPROM"
+    inject_custom_be14_eeprom
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
+
+    step_echo "[2.E] Applying .config file from $LEXY_CONFIG_SRC"
+    cp -v "$LEXY_CONFIG_SRC" ./.config
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
+
+    step_echo "[2.F] Applying all custom/required patches and files..."
     apply_wireless_regdb_patches
     remove_strongswan_patch
     add_noise_fix_patch
     add_tx_power_patches
     apply_additional_mtk_patches
     disable_perf
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
-    step_echo "[2.E] Removing incompatible cryptsetup host-build patch (if present)"
+    step_echo "[2.G] Removing incompatible cryptsetup host-build patch (if present)"
     local CRYPT_PATCH="$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
-    [[ -f "$CRYPT_PATCH" ]] && { echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; }
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    if [[ -f "$CRYPT_PATCH" ]]; then echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; fi
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
-    step_echo "[2.F] Running the MediaTek 'prepare' stage"
+    step_echo "[2.H] Running the MediaTek 'prepare' stage"
     bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd >/dev/null || true; return 1; }
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
-    step_echo "[2.G] Check for patch rejects"
+    validate_profile
+
+    step_echo "[2.I] Check for patch rejects"
     find . -name '*.rej' | while read -r rejfile; do
         echo -e "${RED}PATCH REJECT detected: $rejfile${NC}"
         cat "$rejfile"
         echo -e "${RED}== Build aborted due to patch rejects. Please resolve them above. ==${NC}"
         exit 77
     done
+
     popd >/dev/null || true
-    echo "Tree preparation and patching completed successfully."
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    echo "Tree preparation, patching, and config completed successfully."
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 }
 
 apply_config_and_build() {
     BUILD_START_TIME=$(date +%s)
-    local total_steps=6 current_step=1
+    local total_steps=2 current_step=1
     log_progress "$current_step" "$total_steps"
-    step_echo "Step 3: Applying Final Configuration and Building"
-    [ ! -d "$OPENWRT_DIR" ] && echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
+    step_echo "Step 3: Building (no tree changes allowed in this phase)"
+    step_time_print
+    if [ ! -d "$OPENWRT_DIR" ]; then
+        echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
+    fi
     pushd "$OPENWRT_DIR" >/dev/null
-
-    step_echo "Ensuring custom EEPROM is present"
-    inject_custom_be14_eeprom
-
-    step_echo "Applying .config file from $LEXY_CONFIG_SRC"
-    cp -v "$LEXY_CONFIG_SRC" ./.config
 
     step_echo "Checking available disk space before building..."
     check_space
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
 
-    # Merge mm_config one last time, just before autobuild
-    cp -v "$LEXY_CONFIG_SRC" ./.config
+    # FINAL BUILD CALL, TREE MUST BE UNTOUCHED!
+    step_echo "Starting MediaTek Autobuild (log will be appended to $LOG_FILE)"
+    bash mtk-openwrt-feeds/autobuild/unified/autobuild.sh "$PROFILE" log_file=make jobs="${PARALLEL_JOBS}" | tee -a "$LOG_FILE"
 
-    # Final build call: run MediaTek autobuild with logging, as required
-    step_echo "Starting MediaTek Autobuild (build log will be appended to $LOG_FILE)"
-    bash mtk-openwrt-feeds/autobuild/unified/autobuild.sh "$PROFILE" log_file=make | tee -a "$LOG_FILE"
     popd >/dev/null || true
 
     echo -e "\n\n${NC}##################################################"
@@ -394,9 +453,10 @@ apply_config_and_build() {
         echo -e "${GREEN}SHA256 of build images:${NC}"
         find "$OPENWRT_DIR/bin" -type f -exec sha256sum {} +
     fi
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
     if [[ $BUILD_START_TIME -ne 0 ]]; then
-        local END_BUILD_TIME=$(date +%s)
+        local END_BUILD_TIME
+        END_BUILD_TIME=$(date +%s)
         echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
     fi
 }
@@ -429,8 +489,8 @@ show_menu() {
     echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
     echo "------------------------ THE PROCESS -----------------------"
     echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
-    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, etc.)"
-    echo "3) Apply Final Config & Run Build (make/autobuild)"
+    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, config, etc.)"
+    echo "3) Run Build (autobuild only)"
     echo "------------------------ UTILITIES -------------------------"
     echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
     echo "m) OpenWrt make menuconfig"
@@ -443,6 +503,9 @@ while [[ $# -gt 0 ]]; do
         --force) SKIP_CONFIRM=1 ;;
         --all|--batch|--no-menu) MENU_MODE=0; RUN_ALL=1 ;;
         --profile) PROFILE="$2"; shift 2 ;;
+        --allow-root)
+            ALLOW_ROOT=1; shift
+            ;;
         -h|--help)
 cat <<EOF
 Usage: ./bpi-r4-build-enhanced.sh [options]
@@ -450,6 +513,7 @@ Usage: ./bpi-r4-build-enhanced.sh [options]
 General:
   --all, --batch, --no-menu : Fully automatic build (deletes all previous sources)
   --force                   : Skip confirmation prompts (dangerous: deletes OpenWrt dir)
+  --allow-root              : Allow running the script as root (dangerous)
   --profile name            : Use alternate OpenWrt build profile
   --help                    : Show this help/usage
 
@@ -474,7 +538,7 @@ if [[ $RUN_ALL -eq 1 ]]; then
     clean_and_clone && prepare_tree && apply_config_and_build
     END_SCRIPT_TIME=$(date +%s)
     echo -e "${GREEN}Script completed successfully!${NC}"
-    echo -e "${warn_at_script_end}"
+    for line in "${warn_at_script_end[@]}"; do echo -e "$line"; done
     echo ""
     cat <<EOF
 =======================
