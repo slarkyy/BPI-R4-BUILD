@@ -1,8 +1,9 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ===========================================================================
-#  BPI-R4 / Mediatek OpenWrt Builder Script (outlier enhanced)
+#  BPI-R4 / Mediatek OpenWrt Builder Script (fully outlier enhanced)
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -30,7 +31,7 @@ FEED_PATH="mtk-openwrt-feeds"
 MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
 MTK_BRANCH="master"
 MTK_COMMIT="05615a80ed680b93c3c8337c209d42a2e00db99b"
-MTK_FEED_REV="05615a8"    # 7 chars short hash
+MTK_FEED_REV="05615a8"
 
 PARALLEL_JOBS="${PARALLEL_JOBS:-$(nproc)}"
 SKIP_CONFIRM=0
@@ -250,39 +251,99 @@ inject_custom_be14_eeprom() {
 clean_and_clone() {
     local total_steps=4 current_step=1
     log_progress "$current_step" "$total_steps"
-    step_echo "Step 1: Clean Up & Clone (nuke build dir and get sources at specified commits)"
-    protect_dir_safety "$OPENWRT_DIR"
+    step_echo "Step 1: Nuke OpenWrt and MediaTek feeds directories, then clone fresh"
+
+    local openwrt="$OPENWRT_DIR"
+    local mtkfeeds="$OPENWRT_DIR/$FEED_PATH"
+
     if [[ "$SKIP_CONFIRM" == "0" ]]; then
-        read -p "This will DELETE the '$OPENWRT_DIR' directory (if it exists). Continue? (y/n) " -n 1 -r ; echo
+        echo -e "${RED}WARNING: This will DELETE the following directories (if they exist):${NC}"
+        echo "   $openwrt"
+        echo "   $mtkfeeds"
+        read -p "Continue? (y/n) " -n 1 -r ; echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Operation cancelled."; return 1; fi
     else
         echo "(--force: Skipping confirmation prompt for cleanup.)"
     fi
-    nuke_dir_forcefully "$OPENWRT_DIR"
+
+    nuke_dir_forcefully "$openwrt"
+    [[ -d "$mtkfeeds" ]] && nuke_dir_forcefully "$mtkfeeds"
     rm -f "$CLEAN_MARKER_FILE"
 
+    ((current_step++)); log_progress "$current_step" "$total_steps"
     step_echo "Cloning OpenWrt source (branch ${OPENWRT_BRANCH}, commit ${OPENWRT_COMMIT})..."
-    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$OPENWRT_DIR"
+    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$openwrt"
     (
-        cd "$OPENWRT_DIR"
+        cd "$openwrt"
         git checkout "$OPENWRT_COMMIT"
     )
     ((current_step++)); log_progress "$current_step" "$total_steps"
 
     step_echo "Cloning MediaTek feeds (branch ${MTK_BRANCH}, commit ${MTK_COMMIT})..."
-    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$MTK_BRANCH" "$MTK_REPO" "$OPENWRT_DIR/$FEED_PATH"
+    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$MTK_BRANCH" "$MTK_REPO" "$mtkfeeds"
     (
-        cd "$OPENWRT_DIR/$FEED_PATH"
+        cd "$mtkfeeds"
         git checkout "$MTK_COMMIT"
         echo "${MTK_FEED_REV}" > autobuild/unified/feed_revision
     )
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+    if [[ ! -f "$mtkfeeds/autobuild/unified/autobuild.sh" ]]; then
+        echo -e "${RED}ERROR: Did not find $mtkfeeds/autobuild/unified/autobuild.sh after cloning!${NC}"
+        exit 99
+    fi
     echo "Cloning complete."
     touch "$CLEAN_MARKER_FILE"
     ((current_step++)); log_progress "$current_step" "$total_steps"
 }
+
+prepare_tree() {
+    local total_steps=8 current_step=1
+    log_progress "$current_step" "$total_steps"
+    if [[ ! -d "$OPENWRT_DIR" ]] || [[ ! -f "$OPENWRT_DIR/feeds.conf.default" ]] || [[ ! -f "$OPENWRT_DIR/Makefile" ]] || [[ ! -x "$OPENWRT_DIR/scripts/feeds" ]]; then
+        echo -e "${RED}ERROR: OpenWrt source missing or broken at '$OPENWRT_DIR'. Please run Step 1 to clone.${NC}"
+        return 1
+    fi
+    if [[ -f "$CLEAN_MARKER_FILE" ]]; then
+        rm -f "$CLEAN_MARKER_FILE"
+    else
+        echo -e "${GREEN}Note:${NC} '$OPENWRT_DIR' exists and looks OK. Continuing Step 2 without re-cloning."
+    fi
+    step_echo "Step 2: Preparing the Build Tree (feeds, overlays, patches, etc)"
+    pushd "$OPENWRT_DIR" >/dev/null
+
+    step_echo "[2.A] Cleaning duplicate MediaTek feed references"
+    sed -i "/$FEED_NAME/d" feeds.conf.default
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+
+    step_echo "[2.B] Updating and Installing ALL feeds"
+    ./scripts/feeds update -a
+    ./scripts/feeds install -a
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+
+    step_echo "[2.C] Applying builder overlays from contents/my_files, configs and files"
+    require_folder "$BUILDER_FILES_SRC/my_files"
+    safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
+    require_folder "$BUILDER_FILES_SRC/configs"
+    safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
+    require_folder "$DEVICE_FILES_SRC"
+    safe_rsync "$DEVICE_FILES_SRC/" "./files/"
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+
+    step_echo "[2.D] Applying all custom/required patches and files..."
+    apply_wireless_regdb_patches
+    remove_strongswan_patch
+    add_noise_fix_patch
+    add_tx_power_patches
+    apply_additional_mtk_patches
+    disable_perf
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+
+    step_echo "[2.E] Removing incompatible cryptsetup host-build patch (if present)"
+    local CRYPT_PATCH="$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
+    [[ -f "$CRYPT_PATCH" ]] && { echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; }
+    ((current_step++)); log_progress "$current_step" "$total_steps"
+
     step_echo "[2.F] Running the MediaTek 'prepare' stage"
-    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd; return 1; }
+    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd >/dev/null || true; return 1; }
     ((current_step++)); log_progress "$current_step" "$total_steps"
 
     step_echo "[2.G] Check for patch rejects"
@@ -292,7 +353,7 @@ clean_and_clone() {
         echo -e "${RED}== Build aborted due to patch rejects. Please resolve them above. ==${NC}"
         exit 77
     done
-    popd >/dev/null
+    popd >/dev/null || true
     echo "Tree preparation and patching completed successfully."
     ((current_step++)); log_progress "$current_step" "$total_steps"
 }
@@ -320,8 +381,8 @@ apply_config_and_build() {
 
     # Final build call: run MediaTek autobuild with logging, as required
     step_echo "Starting MediaTek Autobuild (build log will be appended to $LOG_FILE)"
-    bash ../mtk-openwrt-feeds/autobuild/unified/autobuild.sh "$PROFILE" log_file=make | tee -a "$LOG_FILE"
-    popd >/dev/null
+    bash mtk-openwrt-feeds/autobuild/unified/autobuild.sh "$PROFILE" log_file=make | tee -a "$LOG_FILE"
+    popd >/dev/null || true
 
     echo -e "\n\n${NC}##################################################"
     echo "### Build process completed!                    ###"
@@ -347,7 +408,7 @@ openwrt_shell() {
     echo "Dropping you into a shell in $OPENWRT_DIR. Type 'exit' to return."
     pushd "$OPENWRT_DIR" >/dev/null
     bash
-    popd >/dev/null
+    popd >/dev/null || true
 }
 
 openwrt_menuconfig() {
@@ -358,7 +419,7 @@ openwrt_menuconfig() {
     echo -e "${GREEN}Launching OpenWrt make menuconfig...${NC}"
     pushd "$OPENWRT_DIR" >/dev/null
     make menuconfig
-    popd >/dev/null
+    popd >/dev/null || true
 }
 
 show_menu() {
