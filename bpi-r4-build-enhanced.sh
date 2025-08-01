@@ -195,6 +195,7 @@ safe_rsync() {
 apply_wireless_regdb_patches() {
     rm -rf "$OPENWRT_DIR/package/firmware/wireless-regdb/patches/"*.*
     rm -rf "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"*.*
+    mkdir -p "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"
     \cp -r "$BUILDER_FILES_SRC/my_files/500-tx_power.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"
     \cp -r "$BUILDER_FILES_SRC/my_files/regdb.Makefile" "$OPENWRT_DIR/package/firmware/wireless-regdb/Makefile"
 }
