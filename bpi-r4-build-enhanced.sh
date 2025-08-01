@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ===========================================================================
-#  BPI-R4 / Mediatek OpenWrt Builder Script (Outlier enhanced, v2.3)
+#  BPI-R4 / Mediatek OpenWrt Builder Script (Outlier enhanced, v2.4)
 # ===========================================================================
 #  IMPROVEMENTS IN THIS VERSION:
-#  - Script now intelligently searches for control files (mm_config, EEPROM)
-#    in EITHER 'contents/' or 'patches_overlay/', giving the user flexibility.
-#  - rsync is now smart enough to exclude these control files from the overlay.
+#  - Correctly applies custom 'mm_config' AFTER the main MediaTek autobuild
+#    completes, then runs 'make' again to produce the final custom image.
+#    This respects the autobuild script's dependencies.
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -237,38 +237,61 @@ prepare_tree() {
     pushd "$OPENWRT_DIR" >/dev/null
     step_echo "[2.A] Updating and Installing ALL feeds"
     ./scripts/feeds update -a && ./scripts/feeds install -a
+    
     apply_overlays_and_patches
-    step_echo "[2.E] Applying build config"
-    cp -v "$MM_CONFIG_PATH" ./.config
-    local EXTRA_PACKAGES=${EXTRA_PACKAGES:-"luci-app-commands luci-app-advanced-reboot"}
-    echo "Adding extra packages to .config: $EXTRA_PACKAGES"
-    for pkg in $EXTRA_PACKAGES; do
-        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-    done
-    step_echo "[2.F] Running the MediaTek 'prepare' stage"
+    
+    step_echo "[2.E] Running the MediaTek 'prepare' stage"
     bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare
+    
+    step_echo "[2.F] Validating Profile"
     validate_profile
+    
     step_echo "[2.G] Check for patch rejects"
     if find . -name '*.rej' | read -r; then
         echo -e "${RED}== BUILD HALTED: PATCH REJECTS DETECTED! ==${NC}"
         find . -name '*.rej'
         exit 77
     fi
+
     popd >/dev/null
     echo "Tree preparation completed successfully."
 }
 
-apply_config_and_build() {
+build_base_image() {
     BUILD_START_TIME=$(date +%s)
-    step_echo "Step 3: Building"
+    step_echo "Step 3: Building the Base Image (via MediaTek autobuild)"
     if [ ! -d "$OPENWRT_DIR" ]; then echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1; fi
     pushd "$OPENWRT_DIR" >/dev/null
     check_space
-    step_echo "Starting final build process..."
+    step_echo "Starting MediaTek autobuild process..."
     bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" build log_file=make jobs="${PARALLEL_JOBS}" V=s
     local build_status=$?
     popd >/dev/null
-    if [[ $build_status -ne 0 ]]; then echo -e "${RED}ERROR: Build failed with exit code $build_status.${NC}"; exit $build_status; fi
+    if [[ $build_status -ne 0 ]]; then echo -e "${RED}ERROR: Base build failed with exit code $build_status.${NC}"; exit $build_status; fi
+    echo "Base image build completed."
+}
+
+build_custom_image() {
+    step_echo "Step 4: Building the Final Custom Image"
+    if [ ! -f "$OPENWRT_DIR/bin/targets/mediatek/filogic/openwrt-mediatek-filogic-bananapi_bpi-r4-snand-sysupgrade.itb" ]; then 
+        echo -e "${RED}Error: Base image not found. Run Step 3 first.${NC}"; return 1; 
+    fi
+    pushd "$OPENWRT_DIR" >/dev/null
+    step_echo "[4.A] Applying custom build config..."
+    cp -v "$MM_CONFIG_PATH" ./.config
+    local EXTRA_PACKAGES=${EXTRA_PACKAGES:-"luci-app-commands luci-app-advanced-reboot"}
+    echo "Adding extra packages to .config: $EXTRA_PACKAGES"
+    for pkg in $EXTRA_PACKAGES; do
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+    
+    step_echo "[4.B] Re-running 'make' to generate the final image"
+    # The 'make' command will be much faster now, as it's only recompiling/linking what changed.
+    # V=s provides detailed build output for debugging.
+    make -j"${PARALLEL_JOBS}" V=s
+    local build_status=$?
+    popd >/dev/null
+    if [[ $build_status -ne 0 ]]; then echo -e "${RED}ERROR: Final custom build failed with exit code $build_status.${NC}"; exit $build_status; fi
     echo -e "\n\n${NC}##################################################"
     echo "### Build process completed! ###"
     echo "### Find images in '$OPENWRT_DIR/bin/'. ###"
@@ -278,8 +301,9 @@ apply_config_and_build() {
         find "$OPENWRT_DIR/bin" -type f -exec sha256sum {} +
     fi
     local END_BUILD_TIME; END_BUILD_TIME=$(date +%s)
-    echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
+    echo "Total build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
 }
+
 
 # --- Utility Functions ---
 run_menuconfig() {
@@ -305,11 +329,12 @@ openwrt_shell() {
 show_menu() {
     echo ""
     step_echo "BPI-R4 Build Menu"
-    echo "a) Run All Steps (Clean, Prepare, Build)"
+    echo "a) Run All Steps (Clean, Prepare, Base Build, Custom Build)"
     echo "------------------------ THE PROCESS -----------------------"
     echo "1) Clean & Clone Repos (Deletes '$OPENWRT_DIR')"
-    echo "2) Prepare Tree (Feeds, Overlay patches/files, config)"
-    echo "3) Run Build (invokes MediaTek autobuild)"
+    echo "2) Prepare Tree (Feeds, patches, Mediatek 'prepare')"
+    echo "3) Build Base Image (uses Mediatek 'autobuild')"
+    echo "4) Build Final Custom Image (applies your config & runs 'make')"
     echo "------------------------ UTILITIES -------------------------"
     echo "c) Run 'menuconfig' (to customize included packages)"
     echo "d) Clean build artifacts (runs 'make clean')"
@@ -359,7 +384,7 @@ install_dependencies
 check_requirements
 
 if [[ $RUN_ALL -eq 1 ]]; then
-    clean_and_clone && prepare_tree && apply_config_and_build
+    clean_and_clone && prepare_tree && build_base_image && build_custom_image
     END_SCRIPT_TIME=$(date +%s)
     echo -e "${GREEN}Script completed successfully!${NC}"
     for line in "${warn_at_script_end[@]}"; do echo -e "$line"; done
@@ -384,10 +409,11 @@ while (( MENU_MODE )); do
     read -p "Please select an option: " choice
     trap on_error ERR; set -e
     case "$choice" in
-        a|A) clean_and_clone && prepare_tree && apply_config_and_build ;;
+        a|A) clean_and_clone && prepare_tree && build_base_image && build_custom_image ;;
         1) clean_and_clone ;;
         2) prepare_tree ;;
-        3) apply_config_and_build ;;
+        3) build_base_image ;;
+        4) build_custom_image ;;
         c|C) run_menuconfig ;;
         d|D) clean_build_artifacts ;;
         s|S) openwrt_shell ;;
