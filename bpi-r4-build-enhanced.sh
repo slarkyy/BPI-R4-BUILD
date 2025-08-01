@@ -2,7 +2,12 @@
 set -euo pipefail
 
 # ===========================================================================
-#  BPI-R4 / Mediatek OpenWrt Builder Script (Outlier enhanced, v3)
+#  BPI-R4 / Mediatek OpenWrt Builder Script (Outlier enhanced, v2.3)
+# ===========================================================================
+#  IMPROVEMENTS IN THIS VERSION:
+#  - Script now intelligently searches for control files (mm_config, EEPROM)
+#    in EITHER 'contents/' or 'patches_overlay/', giving the user flexibility.
+#  - rsync is now smart enough to exclude these control files from the overlay.
 # ===========================================================================
 
 RED='\033[0;31m'
@@ -13,25 +18,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 LOGS_DIR="$REPO_ROOT/logs"
 CONTENTS_DIR="$REPO_ROOT/contents"
+OVERLAY_DIR="$REPO_ROOT/patches_overlay"
 OPENWRT_DIR="$REPO_ROOT/OpenWRT_BPI_R4"
-PROFILE_DEFAULT="mt7988_rfb"
-LEXY_CONFIG_SRC="$CONTENTS_DIR/mm_config"
-DEVICE_FILES_SRC="$CONTENTS_DIR/files"
-BUILDER_FILES_SRC="$CONTENTS_DIR"
+PROFILE_DEFAULT="filogic-mac80211-mt7988_rfb-mt7996"
 DEST_EEPROM_NAME="mt7996_eeprom_233_2i5i6i.bin"
 MIN_DISK_GB=12
 CLEAN_MARKER_FILE="$REPO_ROOT/.openwrt_cloned_this_session"
 
+# --- Git and Feed Configuration ---
 OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
 OPENWRT_BRANCH="openwrt-24.10"
 OPENWRT_COMMIT="4a18bb1056c78e1224ae3444f5862f6265f9d91c"
-FEED_NAME="mtk_openwrt_feed"
 FEED_PATH="mtk-openwrt-feeds"
 MTK_REPO="https://git01.mediatek.com/openwrt/feeds/mtk-openwrt-feeds"
 MTK_BRANCH="master"
 MTK_COMMIT="05615a80ed680b93c3c8337c209d42a2e00db99b"
 MTK_FEED_REV="05615a8"
 
+# --- Script State Variables ---
 PARALLEL_JOBS="${PARALLEL_JOBS:-$(nproc)}"
 SKIP_CONFIRM=0
 MENU_MODE=1
@@ -42,12 +46,13 @@ warn_at_script_end=()
 DATE_TAG=$(date +"%Y-%m-%d_%H-%M-%S")
 START_SCRIPT_TIME=$(date +%s)
 BUILD_START_TIME=0
-
-PER_STEP_TIMING=0   # set to 1 to track per-step durations
+MM_CONFIG_PATH=""
+EEPROM_PATH=""
 
 cleanup() { tput cnorm || true; }
 trap cleanup EXIT
 
+# --- Helper Functions ---
 require_folder() {
     local dir="$1"
     if [[ ! -d "$dir" ]]; then
@@ -55,19 +60,10 @@ require_folder() {
         exit 1
     fi
 }
-require_file() {
-    local f="$1"
-    if [[ ! -f "$f" ]]; then
-        echo -e "${RED}ERROR: Required file not found: $f${NC}"
-        exit 1
-    fi
-}
 protect_dir_safety() {
     local tgt="$1"
     if [[ "$tgt" == "/" || "$tgt" =~ ^/root/?$ || "$tgt" =~ ^/home/?$ || -z "$tgt" ]]; then
-        echo -e "${RED}Refusing to delete critical system directory: $tgt${NC}"
-        exit 99
-    fi
+        echo -e "${RED}Refusing to delete critical system directory: $tgt${NC}"; exit 99; fi
 }
 nuke_dir_forcefully() {
     local tgt="$1"
@@ -75,17 +71,12 @@ nuke_dir_forcefully() {
     if [[ -e "$tgt" ]]; then
         echo "Removing existing directory (or symlink) '$tgt'..."
         rm -rf --one-file-system "$tgt"
-        if [[ -e "$tgt" ]]; then
-            echo -e "${RED}ERROR: Failed to cleanly remove $tgt. Aborting!${NC}"
-            exit 98
-        fi
+        if [[ -e "$tgt" ]]; then echo -e "${RED}ERROR: Failed to remove $tgt.${NC}"; exit 98; fi
     fi
 }
 
 if [[ "${EUID:-$(id -u)}" -eq 0 && "$ALLOW_ROOT" -eq 0 ]]; then
-    echo -e "${RED}Refusing to run as root! Use --allow-root only if you understand the risks.${NC}" >&2
-    exit 100
-fi
+    echo -e "${RED}Refusing to run as root! Use --allow-root only if you understand the risks.${NC}" >&2; exit 100; fi
 
 mkdir -p "$LOGS_DIR"
 LOG_FILE="$LOGS_DIR/build_log_${DATE_TAG}.txt"
@@ -98,8 +89,7 @@ on_error() {
     echo -e "${RED}#           >>>>> A CRITICAL ERROR OCCURRED <<<<<         #${NC}"
     echo -e "${RED}# Error on line $LINENO: Command '$BASH_COMMAND' exited with status $exit_code.${NC}"
     echo -e "${RED}##########################################################${NC}"
-    echo "Review the build log for diagnostics:"
-    if [[ -f "$LOG_FILE" ]]; then echo "   $LOG_FILE"; fi
+    echo "Review the build log for diagnostics: $LOG_FILE"
     exit "$exit_code"
 }
 trap on_error ERR INT
@@ -110,402 +100,232 @@ step_echo() {
     echo -e "${GREEN}=================================================================${NC}"
 }
 
-log_progress() { echo "Progress: Step $1 of $2"; }
-
-step_timer_start=0
-step_time_print() {
-    if [[ "$PER_STEP_TIMING" -eq 1 && "$step_timer_start" -gt 0 ]]; then
-        local now; now=$(date +%s)
-        echo -e "${GREEN}Step duration: $((now-step_timer_start)) seconds${NC}"
-    fi
-    step_timer_start=$(date +%s)
-}
-
+# --- Pre-flight Checks ---
 check_required_tools() {
     echo "Checking for required tools..."
     local missing=()
     for bin in git make rsync python3 tee wget; do
-        if ! command -v "$bin" &>/dev/null; then
-            missing+=("$bin")
-        fi
+        if ! command -v "$bin" &>/dev/null; then missing+=("$bin"); fi
     done
-    if [[ ${#missing[@]} -ne 0 ]]; then
-        echo -e "${RED}Error: Required commands missing: ${missing[*]}${NC}"
-        echo "Please install these before running this script. Aborting."
-        exit 2
-    fi
+    if [[ ${#missing[@]} -ne 0 ]]; then echo -e "${RED}Error: Missing commands: ${missing[*]}${NC}" >&2; exit 2; fi
 }
 
 check_internet() {
     echo "Checking Internet connectivity..."
-    if ! wget -q --spider https://openwrt.org; then
-        echo -e "${RED}ERROR: Internet connection not available!${NC}" >&2
-        exit 3
-    fi
+    if ! wget -q --spider https://openwrt.org; then echo -e "${RED}ERROR: Internet connection not available!${NC}" >&2; exit 3; fi
 }
 
 install_dependencies() {
     echo "Checking dependencies (Debian/Ubuntu only)..."
     if [[ ! -f "/etc/debian_version" ]]; then
-        echo -e "${RED}WARN: Dependency install only works for Debian/Ubuntu. Please ensure build requirements are met manually!${NC}"
-        warn_at_script_end+=("\n* You may need to install OpenWrt build dependencies manually on your platform!")
-        return
-    fi
-    packages=(
-        build-essential clang flex bison g++ gawk gcc-multilib g++-multilib
-        gettext git libncurses-dev libssl-dev python3-setuptools rsync swig
-        unzip zlib1g-dev file wget
-    )
+        echo -e "${RED}WARN: Auto-dependency install only for Debian/Ubuntu. Please ensure requirements are met manually.${NC}"; return; fi
+    packages=(build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget)
     local missing_packages=()
     for package in "${packages[@]}"; do
-        if ! dpkg -s "$package" &> /dev/null; then
-            missing_packages+=("$package")
-        fi
+        if ! dpkg -s "$package" &> /dev/null; then missing_packages+=("$package"); fi
     done
     if [[ ${#missing_packages[@]} -ne 0 ]]; then
-        echo "The following packages are missing and will be installed: ${missing_packages[*]}"
-        if [[ -z "${SKIP_CONFIRM+x}" || "$SKIP_CONFIRM" -eq 0 ]]; then
-            read -p "Install missing packages with sudo? Continue? (y/n) " -n 1 -r ; echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo "User cancelled dependency installation."
-                exit 20
-            fi
+        echo "Missing packages to be installed: ${missing_packages[*]}"
+        if [[ "$SKIP_CONFIRM" -eq 0 ]]; then
+            read -p "Install missing packages with sudo? (y/n) " -n 1 -r ; echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "User cancelled." ; exit 20; fi
         fi
-        sudo apt-get update
-        sudo apt-get install -y "${missing_packages[@]}"
+        sudo apt-get update && sudo apt-get install -y "${missing_packages[@]}"
     else
         echo "All required dependencies are installed."
     fi
 }
 
 check_requirements() {
-    require_folder "$BUILDER_FILES_SRC/my_files"
-    require_folder "$BUILDER_FILES_SRC/configs"
-    require_folder "$DEVICE_FILES_SRC"
-    require_file "$LEXY_CONFIG_SRC"
-    local EEPROM_BLOBS
-    EEPROM_BLOBS=($(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin'))
-    if [[ ${#EEPROM_BLOBS[@]} -eq 0 ]]; then
-        echo -e "${RED}ERROR: No EEPROM *.bin found at $CONTENTS_DIR${NC}"
-        exit 4
+    step_echo "Verifying required files and directories..."
+    require_folder "$OVERLAY_DIR"
+
+    # Find mm_config in preferred locations
+    if [[ -f "$CONTENTS_DIR/mm_config" ]]; then
+        MM_CONFIG_PATH="$CONTENTS_DIR/mm_config"
+        echo "Found build config at: $MM_CONFIG_PATH"
+    elif [[ -f "$OVERLAY_DIR/mm_config" ]]; then
+        MM_CONFIG_PATH="$OVERLAY_DIR/mm_config"
+        echo "Found build config at: $MM_CONFIG_PATH"
+    else
+        echo -e "${RED}ERROR: Build config 'mm_config' not found in '$CONTENTS_DIR/' or '$OVERLAY_DIR/'.${NC}"; exit 4;
     fi
-    if [[ ${#EEPROM_BLOBS[@]} -gt 1 ]]; then
-        echo -e "${RED}Warning: Multiple EEPROM blobs found: ${EEPROM_BLOBS[*]}. Using '${EEPROM_BLOBS[0]}' by default.${NC}"
+
+    # Find EEPROM .bin file in preferred locations
+    local eeprom_files_contents=($(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin'))
+    local eeprom_files_overlay=($(find "$OVERLAY_DIR" -maxdepth 1 -type f -iname '*.bin'))
+    if [[ ${#eeprom_files_contents[@]} -gt 0 ]]; then
+        EEPROM_PATH="${eeprom_files_contents[0]}"
+        echo "Found EEPROM file at: $EEPROM_PATH"
+    elif [[ ${#eeprom_files_overlay[@]} -gt 0 ]]; then
+        EEPROM_PATH="${eeprom_files_overlay[0]}"
+        echo "Found EEPROM file at: $EEPROM_PATH"
+    else
+        echo -e "${RED}ERROR: EEPROM '*.bin' file not found in '$CONTENTS_DIR/' or '$OVERLAY_DIR/'.${NC}"; exit 4;
     fi
 }
 
 check_space() {
-    local avail
-    avail=$(df --output=avail "$REPO_ROOT" | tail -1)
-    local avail_gb=$((avail/1024/1024))
+    local avail_gb=$(( $(df --output=avail "$REPO_ROOT" | tail -1) / 1024 / 1024 ))
     if [[ "$avail_gb" -lt "$MIN_DISK_GB" ]]; then
-        echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk on $REPO_ROOT. (Available: ${avail_gb}GB)${NC}"
-        exit 5
-    fi
+        echo -e "${RED}ERROR: Less than ${MIN_DISK_GB}GB free disk space. (Available: ${avail_gb}GB)${NC}"; exit 5; fi
 }
 
 safe_rsync() {
-    local SRC="$1"
-    local DST="$2"
-    if ! rsync -a --delete --info=progress2 "$SRC" "$DST"; then
-        echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"
-        exit 6
-    fi
+    # INTELLIGENT RSYNC: Exclude control files so they are not copied into the source tree.
+    # The script will handle them separately.
+    local SRC="$1/" DST="$2/"
+    if ! rsync -a --delete --info=progress2 --exclude='mm_config' --exclude='*.bin' "$SRC" "$DST"; then
+        echo -e "${RED}rsync failed copying $SRC to $DST.${NC}"; exit 6; fi
 }
 
 validate_profile() {
-    # Only run after $OPENWRT_DIR is present.
-    # Check for the existence of the profile for autobuild
-    if [[ ! -d "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic" ]]; then
-        echo -e "${RED}ERROR: Unable to validate profile (directory structure missing)${NC}"
-        return 1
+    local profile_dir_name
+    if [[ "$PROFILE" =~ mt798[68]_.+ ]]; then
+        profile_dir_name=$(echo "$PROFILE" | grep -o 'mt798[68]_[^-_]*')
+    else
+        profile_dir_name="$PROFILE"
     fi
-    local valid_profiles
-    valid_profiles=($(find "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic" -maxdepth 1 -type d -name "${PROFILE}*" -printf "%f\n"))
-    if [[ "${#valid_profiles[@]}" -eq 0 ]]; then
-        echo -e "${RED}ERROR: Profile '$PROFILE' does not appear to be valid.${NC}"
-        echo "Check the available profiles in '$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/'"
-        exit 21
-    fi
-    # else OK
+    if [[ ! -d "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/$profile_dir_name" ]]; then
+        echo -e "${RED}ERROR: Profile directory for '$PROFILE' ('$profile_dir_name') not valid.${NC}"; exit 21; fi
+    echo "Profile '$PROFILE' validated. Using directory: $profile_dir_name"
 }
 
-apply_wireless_regdb_patches() {
-    rm -rf "$OPENWRT_DIR/package/firmware/wireless-regdb/patches/"*.*
-    rm -rf "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"*.*
-    mkdir -p "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/500-tx_power.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/firmware/wireless-regdb/patches/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/regdb.Makefile" "$OPENWRT_DIR/package/firmware/wireless-regdb/Makefile"
-}
-remove_strongswan_patch() {
-    rm -rf "$OPENWRT_DIR/$FEED_PATH/24.10/patches-feeds/108-strongswan-add-uci-support.patch"
-}
-add_noise_fix_patch() {
-    mkdir -p "$OPENWRT_DIR/package/network/utils/iwinfo/patches/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/200-v.kosikhin-libiwinfo-fix_noise_reading_for_radios.patch" "$OPENWRT_DIR/package/network/utils/iwinfo/patches/"
-}
-add_tx_power_patches() {
-   mkdir -p "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
-   \cp -r "$BUILDER_FILES_SRC/my_files/99999_tx_power_check.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
-   \cp -r "$BUILDER_FILES_SRC/my_files/9997-use-tx_power-from-default-fw-if-EEPROM-contains-0s.patch" "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/"
-}
-apply_additional_mtk_patches() {
-    local f="$OPENWRT_DIR/$FEED_PATH"
-    mkdir -p "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    mkdir -p "$f/autobuild/unified/filogic/24.10/patches-feeds/"
-    mkdir -p "$f/feed/kernel/crypto-eip/src/"
-    mkdir -p "$f/24.10/patches-base/"
-    mkdir -p "$f/autobuild/unified/filogic/24.10/files/scripts/make-squashfs-hashed.sh"
-    mkdir -p "$f/24.10/files/target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/"
-    rm -rf "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_eth_reset.c"
-    rm -rf "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_eth_reset.h"
-    \cp -r "$BUILDER_FILES_SRC/my_files/mtk_eth_reset.c"  "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/mtk_eth_reset.h"  "$f/autobuild/unified/filogic/24.10/files/target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/"
-    rm -rf "$f/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
-    rm -rf "$f/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-03-enable-veritysetup.patch"
-    \cp -r "$BUILDER_FILES_SRC/my_files/cryptsetup-01-add-host-build.patch"  "$f/autobuild/unified/filogic/24.10/patches-feeds/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-2702-crypto-avoid-rcu-stall.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    rm -rf "$f/24.10/files/target/linux/mediatek/patches-6.6/999-cpufreq-02-mediatek-enable-using-efuse-cali-data-for-mt7988-cpu-volt.patch"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-cpufreq-01-cpufreq-add-support-to-adjust-cpu-volt-by-efuse-cali.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-cpufreq-02-cpufreq-add-cpu-volt-correction-support-for-mt7988.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-cpufreq-03-mediatek-enable-using-efuse-cali-data-for-mt7988-cpu-volt.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-cpufreq-04-cpufreq-add-support-to-fix-voltage-cpu.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/999-cpufreq-05-cpufreq-mediatek-Add-support-for-MT7987.patch" "$f/24.10/files/target/linux/mediatek/patches-6.6/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/ddk-wrapper.c" "$f/feed/kernel/crypto-eip/src/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/mt7988a-rfb-4pcie.dtso" "$f/24.10/files/target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/"
-    \cp -r "$BUILDER_FILES_SRC/my_files/1120-image-mediatek-filogic-mt7988a-rfb-05-add-4pcie-overlays.patch" "$f/24.10/patches-base/"
-    rm -rf "$f/feed/app/regs/src/regs.c"
-    \cp -r "$BUILDER_FILES_SRC/my_files/regs.c" "$f/feed/app/regs/src/"
-    rm -rf "$f/autobuild/unified/filogic/24.10/files/scripts/make-squashfs-hashed.sh"
-    \cp -r "$BUILDER_FILES_SRC/my_files/make-squashfs-hashed.sh" "$f/autobuild/unified/filogic/24.10/files/scripts/"
-}
-disable_perf() {
-    sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/defconfig" || true
-    sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/autobuild_5.4_mac80211_release/mt7988_wifi7_mac80211_mlo/.config" || true
-    sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/autobuild_5.4_mac80211_release/mt7986_mac80211/.config" || true
-}
-inject_custom_be14_eeprom() {
-    local EEPROM_BLOBS
-    EEPROM_BLOBS=($(find "$CONTENTS_DIR" -maxdepth 1 -type f -iname '*.bin'))
-    local eeprom_src="${EEPROM_BLOBS[0]}"
-    local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/$DEST_EEPROM_NAME"
-    if [[ ! -f "$eeprom_src" ]]; then
-        echo -e "${RED}ERROR: BE14 EEPROM .bin not found at $eeprom_src${NC}"
-        exit 7
-    fi
-    mkdir -p "$(dirname "$eeprom_dst")"
-    cp -af "$eeprom_src" "$eeprom_dst"
-    echo "Copied EEPROM as $eeprom_dst"
-}
-
+# --- Core Build Logic ---
 clean_and_clone() {
-    local total_steps=4 current_step=1
-    log_progress "$current_step" "$total_steps"
-    step_echo "Step 1: Nuke OpenWrt and MediaTek feeds directories, then clone fresh"
-    step_time_print
-
-    local openwrt="$OPENWRT_DIR"
-    local mtkfeeds="$OPENWRT_DIR/$FEED_PATH"
-
-    if [[ "$SKIP_CONFIRM" == "0" ]]; then
-        echo -e "${RED}WARNING: This will DELETE the following directories (if they exist):${NC}"
-        echo "   $openwrt"
-        echo "   $mtkfeeds"
+    step_echo "Step 1: Nuke OpenWrt directory, then clone fresh"
+    if [[ "$SKIP_CONFIRM" -eq 0 ]]; then
+        echo -e "${RED}WARNING: This will DELETE the directory: $OPENWRT_DIR${NC}"
         read -p "Continue? (y/n) " -n 1 -r ; echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Operation cancelled."; return 1; fi
-    else
-        echo "(--force: Skipping confirmation prompt for cleanup.)"
     fi
-
-    nuke_dir_forcefully "$openwrt"
-    [[ -d "$mtkfeeds" ]] && nuke_dir_forcefully "$mtkfeeds"
-    rm -f "$CLEAN_MARKER_FILE"
-
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-    step_echo "Cloning OpenWrt source (branch ${OPENWRT_BRANCH}, commit ${OPENWRT_COMMIT})..."
-    step_time_print
-    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$openwrt"
-    (
-        cd "$openwrt"
-        git checkout "$OPENWRT_COMMIT"
-    )
-    ((current_step++)); log_progress "$current_step" "$total_steps"
-
-    step_echo "Cloning MediaTek feeds (branch ${MTK_BRANCH}, commit ${MTK_COMMIT})..."
-    step_time_print
+    nuke_dir_forcefully "$OPENWRT_DIR" && rm -f "$CLEAN_MARKER_FILE"
+    step_echo "Cloning OpenWrt source..."
+    GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$OPENWRT_DIR"
+    (cd "$OPENWRT_DIR" && git checkout "$OPENWRT_COMMIT")
+    step_echo "Cloning MediaTek feeds..."
+    local mtkfeeds="$OPENWRT_DIR/$FEED_PATH"
     GIT_TERMINAL_PROMPT=0 git clone --progress --branch "$MTK_BRANCH" "$MTK_REPO" "$mtkfeeds"
-    (
-        cd "$mtkfeeds"
-        git checkout "$MTK_COMMIT"
-        echo "${MTK_FEED_REV}" > autobuild/unified/feed_revision
-    )
-    if [[ ! -f "$mtkfeeds/autobuild/unified/autobuild.sh" ]]; then
-        echo -e "${RED}ERROR: Did not find $mtkfeeds/autobuild/unified/autobuild.sh after cloning!${NC}"
-        exit 99
-    fi
-    echo "Cloning complete."
+    (cd "$mtkfeeds" && git checkout "$MTK_COMMIT" && echo "${MTK_FEED_REV}" > autobuild/unified/feed_revision)
+    if [[ ! -f "$mtkfeeds/autobuild/unified/autobuild.sh" ]]; then echo -e "${RED}ERROR: MediaTek autobuild script not found!${NC}"; exit 99; fi
     touch "$CLEAN_MARKER_FILE"
-    ((current_step++)); log_progress "$current_step" "$total_steps"
+}
+
+apply_overlays_and_patches() {
+    step_echo "[2.B] Applying all custom patches and files from overlay directory"
+    require_folder "$OVERLAY_DIR"
+    safe_rsync "$OVERLAY_DIR" "$OPENWRT_DIR"
+    step_echo "[2.C] Applying dynamic modifications and cleanups"
+    echo "Removing known incompatible files..."
+    rm -f "$OPENWRT_DIR/$FEED_PATH/24.10/patches-feeds/108-strongswan-add-uci-support.patch"
+    rm -f "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
+    echo "Disabling perf package..."
+    sed -i 's/CONFIG_PACKAGE_perf=y/# CONFIG_PACKAGE_perf is not set/' "$OPENWRT_DIR/$FEED_PATH/autobuild/unified/filogic/mac80211/24.10/defconfig" || true
+    step_echo "[2.D] Injecting custom EEPROM"
+    local eeprom_dst="$OPENWRT_DIR/files/lib/firmware/mediatek/mt7996/$DEST_EEPROM_NAME"
+    mkdir -p "$(dirname "$eeprom_dst")"
+    cp -af "$EEPROM_PATH" "$eeprom_dst"
+    echo "Copied EEPROM to $eeprom_dst"
 }
 
 prepare_tree() {
-    local total_steps=9 current_step=1
-    log_progress "$current_step" "$total_steps"
-    if [[ ! -d "$OPENWRT_DIR" ]] || [[ ! -f "$OPENWRT_DIR/feeds.conf.default" ]] || [[ ! -f "$OPENWRT_DIR/Makefile" ]] || [[ ! -x "$OPENWRT_DIR/scripts/feeds" ]]; then
-        echo -e "${RED}ERROR: OpenWrt source missing or broken at '$OPENWRT_DIR'. Please run Step 1 to clone.${NC}"
-        return 1
+    if [[ ! -d "$OPENWRT_DIR" ]]; then echo -e "${RED}ERROR: OpenWrt source missing. Run Step 1.${NC}"; return 1; fi
+    if [[ -f "$CLEAN_MARKER_FILE" ]]; then rm -f "$CLEAN_MARKER_FILE"; else
+        echo -e "${GREEN}Note:${NC} '$OPENWRT_DIR' exists. Continuing without re-cloning."
     fi
-    if [[ -f "$CLEAN_MARKER_FILE" ]]; then
-        rm -f "$CLEAN_MARKER_FILE"
-    else
-        echo -e "${GREEN}Note:${NC} '$OPENWRT_DIR' exists and looks OK. Continuing Step 2 without re-cloning."
-    fi
-    step_echo "Step 2: Preparing the Build Tree (feeds, overlays, patches, config, EEPROM, etc)"
-    step_time_print
+    step_echo "Step 2: Preparing the Build Tree"
     pushd "$OPENWRT_DIR" >/dev/null
-
-    step_echo "[2.A] Cleaning duplicate MediaTek feed references"
-    sed -i "/$FEED_NAME/d" feeds.conf.default
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.B] Updating and Installing ALL feeds"
-    ./scripts/feeds update -a
-    ./scripts/feeds install -a
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.C] Applying builder overlays from contents/my_files, configs and files"
-    require_folder "$BUILDER_FILES_SRC/my_files"
-    safe_rsync "$BUILDER_FILES_SRC/my_files/" "./my_files/"
-    require_folder "$BUILDER_FILES_SRC/configs"
-    safe_rsync "$BUILDER_FILES_SRC/configs/" "./configs/"
-    require_folder "$DEVICE_FILES_SRC"
-    safe_rsync "$DEVICE_FILES_SRC/" "./files/"
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.D] Injecting custom EEPROM"
-    inject_custom_be14_eeprom
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.E] Applying .config file from $LEXY_CONFIG_SRC"
-    cp -v "$LEXY_CONFIG_SRC" ./.config
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.F] Applying all custom/required patches and files..."
-    apply_wireless_regdb_patches
-    remove_strongswan_patch
-    add_noise_fix_patch
-    add_tx_power_patches
-    apply_additional_mtk_patches
-    disable_perf
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.G] Removing incompatible cryptsetup host-build patch (if present)"
-    local CRYPT_PATCH="$FEED_PATH/autobuild/unified/filogic/24.10/patches-feeds/cryptsetup-01-add-host-build.patch"
-    if [[ -f "$CRYPT_PATCH" ]]; then echo "Deleting incompatible cryptsetup host-build patch!"; rm -v "$CRYPT_PATCH"; fi
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    step_echo "[2.H] Running the MediaTek 'prepare' stage"
-    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare || { echo -e "${RED}ERROR: The MediaTek 'prepare' stage failed.${NC}"; popd >/dev/null || true; return 1; }
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    validate_profile
-
-    step_echo "[2.I] Check for patch rejects"
-    find . -name '*.rej' | while read -r rejfile; do
-        echo -e "${RED}PATCH REJECT detected: $rejfile${NC}"
-        cat "$rejfile"
-        echo -e "${RED}== Build aborted due to patch rejects. Please resolve them above. ==${NC}"
-        exit 77
+    step_echo "[2.A] Updating and Installing ALL feeds"
+    ./scripts/feeds update -a && ./scripts/feeds install -a
+    apply_overlays_and_patches
+    step_echo "[2.E] Applying build config"
+    cp -v "$MM_CONFIG_PATH" ./.config
+    local EXTRA_PACKAGES=${EXTRA_PACKAGES:-"luci-app-commands luci-app-advanced-reboot"}
+    echo "Adding extra packages to .config: $EXTRA_PACKAGES"
+    for pkg in $EXTRA_PACKAGES; do
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
-
-    popd >/dev/null || true
-    echo "Tree preparation, patching, and config completed successfully."
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
+    step_echo "[2.F] Running the MediaTek 'prepare' stage"
+    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" prepare
+    validate_profile
+    step_echo "[2.G] Check for patch rejects"
+    if find . -name '*.rej' | read -r; then
+        echo -e "${RED}== BUILD HALTED: PATCH REJECTS DETECTED! ==${NC}"
+        find . -name '*.rej'
+        exit 77
+    fi
+    popd >/dev/null
+    echo "Tree preparation completed successfully."
 }
 
 apply_config_and_build() {
     BUILD_START_TIME=$(date +%s)
-    local total_steps=2 current_step=1
-    log_progress "$current_step" "$total_steps"
-    step_echo "Step 3: Building (no tree changes allowed in this phase)"
-    step_time_print
-    if [ ! -d "$OPENWRT_DIR" ]; then
-        echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1
-    fi
+    step_echo "Step 3: Building"
+    if [ ! -d "$OPENWRT_DIR" ]; then echo -e "${RED}Error: Tree not prepared. Run Step 2.${NC}" && return 1; fi
     pushd "$OPENWRT_DIR" >/dev/null
-
-    step_echo "Checking available disk space before building..."
     check_space
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-
-    # FINAL BUILD CALL, TREE MUST BE UNTOUCHED!
-    step_echo "Starting MediaTek Autobuild (log will be appended to $LOG_FILE)"
-    bash mtk-openwrt-feeds/autobuild/unified/autobuild.sh "$PROFILE" log_file=make jobs="${PARALLEL_JOBS}" | tee -a "$LOG_FILE"
-
-    popd >/dev/null || true
-
+    step_echo "Starting final build process..."
+    bash "$FEED_PATH/autobuild/unified/autobuild.sh" "$PROFILE" build log_file=make jobs="${PARALLEL_JOBS}" V=s
+    local build_status=$?
+    popd >/dev/null
+    if [[ $build_status -ne 0 ]]; then echo -e "${RED}ERROR: Build failed with exit code $build_status.${NC}"; exit $build_status; fi
     echo -e "\n\n${NC}##################################################"
-    echo "### Build process completed!                    ###"
-    echo "### Find images in '$OPENWRT_DIR/bin/'.         ###"
-    echo "### See log: $LOG_FILE"
+    echo "### Build process completed! ###"
+    echo "### Find images in '$OPENWRT_DIR/bin/'. ###"
     echo "##################################################"
     if [[ -d "$OPENWRT_DIR/bin" ]]; then
         echo -e "${GREEN}SHA256 of build images:${NC}"
         find "$OPENWRT_DIR/bin" -type f -exec sha256sum {} +
     fi
-    ((current_step++)); log_progress "$current_step" "$total_steps"; step_time_print
-    if [[ $BUILD_START_TIME -ne 0 ]]; then
-        local END_BUILD_TIME
-        END_BUILD_TIME=$(date +%s)
-        echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
-    fi
+    local END_BUILD_TIME; END_BUILD_TIME=$(date +%s)
+    echo "Build phase duration: $((END_BUILD_TIME - BUILD_START_TIME)) seconds"
 }
 
-openwrt_shell() {
-    if [ ! -d "$OPENWRT_DIR" ]; then
-        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
-        return 1
-    fi
-    echo "Dropping you into a shell in $OPENWRT_DIR. Type 'exit' to return."
-    pushd "$OPENWRT_DIR" >/dev/null
-    bash
-    popd >/dev/null || true
-}
-
-openwrt_menuconfig() {
-    if [ ! -d "$OPENWRT_DIR" ]; then
-        echo -e "${RED}OpenWrt directory ($OPENWRT_DIR) not found. Run Step 1.${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}Launching OpenWrt make menuconfig...${NC}"
+# --- Utility Functions ---
+run_menuconfig() {
+    if [[ ! -f "$OPENWRT_DIR/.config" ]]; then echo -e "${RED}Error: .config not found. Run Step 2 first.${NC}" && return 1; fi
     pushd "$OPENWRT_DIR" >/dev/null
     make menuconfig
-    popd >/dev/null || true
+    read -p "Save updated .config back to '$MM_CONFIG_PATH'? (y/n) " -n 1 -r ; echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then cp -v ./.config "$MM_CONFIG_PATH" && echo "Config saved."; fi
+    popd >/dev/null
 }
-
+clean_build_artifacts() {
+    if [[ ! -d "$OPENWRT_DIR" ]]; then echo -e "${RED}OpenWrt directory not found.${NC}" && return 1; fi
+    pushd "$OPENWRT_DIR" >/dev/null
+    echo "Cleaning build artifacts (make clean)..."
+    make clean
+    popd >/dev/null
+}
+openwrt_shell() {
+    if [[ ! -d "$OPENWRT_DIR" ]]; then echo -e "${RED}OpenWrt directory not found. Run Step 1.${NC}" && return 1; fi
+    echo "Dropping you into a shell in $OPENWRT_DIR. Type 'exit' to return."
+    (cd "$OPENWRT_DIR" && bash)
+}
 show_menu() {
     echo ""
-    step_echo "BPI-R4 Build Menu (overlays in contents/)"
-    echo "a) Run All Steps (Will start FRESH, deletes previous sources)"
+    step_echo "BPI-R4 Build Menu"
+    echo "a) Run All Steps (Clean, Prepare, Build)"
     echo "------------------------ THE PROCESS -----------------------"
-    echo "1) Clean Up & Clone Repos (Deletes '$OPENWRT_DIR')"
-    echo "2) Prepare Tree (Feeds, Inject Firmware/EEPROM, patches, config, etc.)"
-    echo "3) Run Build (autobuild only)"
+    echo "1) Clean & Clone Repos (Deletes '$OPENWRT_DIR')"
+    echo "2) Prepare Tree (Feeds, Overlay patches/files, config)"
+    echo "3) Run Build (invokes MediaTek autobuild)"
     echo "------------------------ UTILITIES -------------------------"
-    echo "s) Enter OpenWrt Directory Shell (debug/inspection)"
-    echo "m) OpenWrt make menuconfig"
+    echo "c) Run 'menuconfig' (to customize included packages)"
+    echo "d) Clean build artifacts (runs 'make clean')"
+    echo "s) Enter OpenWrt Directory Shell (for manual debugging)"
     echo "q) Quit"
     echo ""
 }
 
+# --- Main Execution Logic ---
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --force) SKIP_CONFIRM=1 ;;
-        --all|--batch|--no-menu) MENU_MODE=0; RUN_ALL=1 ;;
+        --force) SKIP_CONFIRM=1; shift ;;
+        --all|--batch|--no-menu) MENU_MODE=0; RUN_ALL=1; shift ;;
         --profile) PROFILE="$2"; shift 2 ;;
-        --allow-root)
-            ALLOW_ROOT=1; shift
-            ;;
+        --allow-root) ALLOW_ROOT=1; shift ;;
         -h|--help)
 cat <<EOF
 Usage: ./bpi-r4-build-enhanced.sh [options]
@@ -513,15 +333,19 @@ Usage: ./bpi-r4-build-enhanced.sh [options]
 General:
   --all, --batch, --no-menu : Fully automatic build (deletes all previous sources)
   --force                   : Skip confirmation prompts (dangerous: deletes OpenWrt dir)
-  --allow-root              : Allow running the script as root (dangerous)
+  --allow-root              : Allow running the script as root (very dangerous)
   --profile name            : Use alternate OpenWrt build profile
-  --help                    : Show this help/usage
+  -h, --help                : Show this help/usage
 
-Directory structure:
-  ./contents/   Overlays (my_files/, configs/, files/, mm_config, etc)
-  ./logs/       Build and script logs
-  ./OpenWRT_BPI_R4/bin/  Images built
+Directory structure (two options):
+  1. Separated (Recommended):
+     ./contents/        -> For script assets (mm_config, EEPROM .bin)
+     ./patches_overlay/ -> For all source and filesystem modifications
 
+  2. Consolidated:
+     ./patches_overlay/ -> Contains EVERYTHING (mm_config, .bin, files/, patches)
+
+  The script will intelligently find the files in either setup.
 EOF
         exit 0
         ;;
@@ -564,8 +388,9 @@ while (( MENU_MODE )); do
         1) clean_and_clone ;;
         2) prepare_tree ;;
         3) apply_config_and_build ;;
+        c|C) run_menuconfig ;;
+        d|D) clean_build_artifacts ;;
         s|S) openwrt_shell ;;
-        m|M) openwrt_menuconfig ;;
         q|Q)
             tput cnorm
             END_SCRIPT_TIME=$(date +%s)
